@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -206,7 +207,7 @@ fn run_timed_pull_output(
     } else {
         None
     };
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, None);
     let mut next_tick = Instant::now();
     let start = Instant::now();
 
@@ -251,10 +252,17 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
         name, config.sample_rate, config.channels, sample_format
     );
 
-    let stream = build_jitter_output_stream(&device, sample_format, &config, jitter.clone())?;
+    let callback_metrics = Arc::new(OutputCallbackMetrics::default());
+    let stream = build_jitter_output_stream(
+        &device,
+        sample_format,
+        &config,
+        jitter.clone(),
+        Arc::clone(&callback_metrics),
+    )?;
     stream.play().context("failed to start output stream")?;
 
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, Some(callback_metrics));
     let start = Instant::now();
     loop {
         if duration_elapsed(start, args.duration_sec) {
@@ -270,18 +278,23 @@ fn build_jitter_output_stream(
     sample_format: SampleFormat,
     config: &StreamConfig,
     jitter: Arc<Mutex<JitterBuffer>>,
+    callback_metrics: Arc<OutputCallbackMetrics>,
 ) -> Result<Stream> {
     let err_fn = |err| eprintln!("audio output stream error: {err}");
     let output_sample_rate = config.sample_rate;
+    let channels = usize::from(config.channels.max(1));
     let stream = match sample_format {
         SampleFormat::F32 => {
             let jitter = jitter.clone();
+            let callback_metrics = Arc::clone(&callback_metrics);
             device.build_output_stream(
                 *config,
                 move |data: &mut [f32], _| {
+                    callback_metrics.record_callback(data.len() / channels);
                     if let Ok(mut jitter) = jitter.try_lock() {
                         jitter.pull_f32_at_sample_rate(data, output_sample_rate);
                     } else {
+                        callback_metrics.record_lock_miss();
                         data.fill(0.0);
                     }
                 },
@@ -291,12 +304,15 @@ fn build_jitter_output_stream(
         }
         SampleFormat::I16 => {
             let jitter = jitter.clone();
+            let callback_metrics = Arc::clone(&callback_metrics);
             device.build_output_stream(
                 *config,
                 move |data: &mut [i16], _| {
+                    callback_metrics.record_callback(data.len() / channels);
                     if let Ok(mut jitter) = jitter.try_lock() {
                         jitter.pull_i16_at_sample_rate(data, output_sample_rate);
                     } else {
+                        callback_metrics.record_lock_miss();
                         data.fill(0);
                     }
                 },
@@ -306,9 +322,11 @@ fn build_jitter_output_stream(
         }
         SampleFormat::U16 => {
             let jitter = jitter.clone();
+            let callback_metrics = Arc::clone(&callback_metrics);
             device.build_output_stream(
                 *config,
                 move |data: &mut [u16], _| {
+                    callback_metrics.record_callback(data.len() / channels);
                     if let Ok(mut jitter) = jitter.try_lock() {
                         let mut tmp = vec![0.0f32; data.len()];
                         jitter.pull_f32_at_sample_rate(&mut tmp, output_sample_rate);
@@ -316,6 +334,7 @@ fn build_jitter_output_stream(
                             *dst = f32_to_u16(src);
                         }
                     } else {
+                        callback_metrics.record_lock_miss();
                         data.fill(u16::MAX / 2);
                     }
                 },
@@ -455,18 +474,55 @@ fn fill_tone_f32(
     }
 }
 
+#[derive(Default)]
+struct OutputCallbackMetrics {
+    callbacks: AtomicU64,
+    frames: AtomicU64,
+    lock_misses: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OutputCallbackSnapshot {
+    callbacks: u64,
+    frames: u64,
+    lock_misses: u64,
+}
+
+impl OutputCallbackMetrics {
+    fn record_callback(&self, frames: usize) {
+        self.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.frames.fetch_add(frames as u64, Ordering::Relaxed);
+    }
+
+    fn record_lock_miss(&self) {
+        self.lock_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> OutputCallbackSnapshot {
+        OutputCallbackSnapshot {
+            callbacks: self.callbacks.load(Ordering::Relaxed),
+            frames: self.frames.load(Ordering::Relaxed),
+            lock_misses: self.lock_misses.load(Ordering::Relaxed),
+        }
+    }
+}
+
 struct MetricsPrinter {
     interval: Duration,
     last: Instant,
     last_metrics: Option<JitterMetrics>,
+    callback_metrics: Option<Arc<OutputCallbackMetrics>>,
+    last_callback_metrics: OutputCallbackSnapshot,
 }
 
 impl MetricsPrinter {
-    fn new(interval_sec: f64) -> Self {
+    fn new(interval_sec: f64, callback_metrics: Option<Arc<OutputCallbackMetrics>>) -> Self {
         Self {
             interval: Duration::from_secs_f64(interval_sec.max(0.1)),
             last: Instant::now(),
             last_metrics: None,
+            callback_metrics,
+            last_callback_metrics: OutputCallbackSnapshot::default(),
         }
     }
 
@@ -474,7 +530,7 @@ impl MetricsPrinter {
         if self.last.elapsed() < self.interval {
             return;
         }
-        let Ok(jitter) = jitter.lock() else {
+        let Ok(jitter) = jitter.try_lock() else {
             return;
         };
         let metrics = jitter.metrics();
@@ -483,28 +539,53 @@ impl MetricsPrinter {
 
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let previous = self.last_metrics.clone().unwrap_or_default();
+        let callback_metrics = self
+            .callback_metrics
+            .as_ref()
+            .map(|metrics| metrics.snapshot())
+            .unwrap_or_default();
         let trimmed_frames = metrics.trimmed_frames - previous.trimmed_frames;
         let trimmed_ms_per_sec = trimmed_frames as f64 * 1000.0 / SAMPLE_RATE as f64 / elapsed;
+        let callback_delta = callback_metrics
+            .callbacks
+            .saturating_sub(self.last_callback_metrics.callbacks);
+        let callback_frames_delta = callback_metrics
+            .frames
+            .saturating_sub(self.last_callback_metrics.frames);
+        let lock_miss_delta = callback_metrics
+            .lock_misses
+            .saturating_sub(self.last_callback_metrics.lock_misses);
         println!(
-            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s buffer={:.1}ms target={}ms ratio={:.6} drift={:.1}ppm underruns={} trims={} trim={:.1}ms/s resyncs={}",
+            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms device_ratio={:.6} corr={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             (metrics.lost_packets - previous.lost_packets) as f64 / elapsed,
             (metrics.late_packets - previous.late_packets) as f64 / elapsed,
             (metrics.duplicate_packets - previous.duplicate_packets) as f64 / elapsed,
             (metrics.out_of_order_packets - previous.out_of_order_packets) as f64 / elapsed,
-            metrics.buffer_level_ms,
+            metrics.audio_latency_ms,
             target_ms,
-            metrics.resample_ratio,
+            metrics.device_resample_ratio,
+            metrics.correction_ppm,
+            metrics.effective_resample_ratio,
             metrics.estimated_drift_ppm,
-            metrics.output_underruns,
+            metrics.startup_underruns,
+            metrics.steady_underruns,
+            (metrics.missing_frame_calls - previous.missing_frame_calls) as f64 / elapsed,
+            (metrics.missing_frames - previous.missing_frames) as f64 / elapsed,
+            callback_delta as f64 / elapsed,
+            callback_frames_delta as f64 / elapsed,
+            lock_miss_delta as f64 / elapsed,
             metrics.latency_trims,
             trimmed_ms_per_sec,
-            metrics.resyncs
+            metrics.resyncs,
+            metrics.resyncs_by_stream_change,
+            metrics.resyncs_by_underrun
         );
 
         self.last = Instant::now();
         self.last_metrics = Some(metrics);
+        self.last_callback_metrics = callback_metrics;
     }
 }
 

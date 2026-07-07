@@ -53,14 +53,23 @@ pub struct JitterMetrics {
     pub late_packets: u64,
     pub invalid_packets: u64,
     pub output_underruns: u64,
+    pub startup_underruns: u64,
+    pub steady_underruns: u64,
+    pub missing_frame_calls: u64,
     pub missing_frames: u64,
     pub latency_trims: u64,
     pub trimmed_frames: u64,
     pub resyncs: u64,
+    pub resyncs_by_stream_change: u64,
+    pub resyncs_by_underrun: u64,
     pub latest_sequence: Option<u32>,
     pub latest_sample_position: Option<u64>,
     pub buffer_level_ms: f32,
+    pub audio_latency_ms: f32,
     pub resample_ratio: f32,
+    pub device_resample_ratio: f32,
+    pub correction_ppm: f32,
+    pub effective_resample_ratio: f32,
     pub estimated_drift_ppm: f32,
 }
 
@@ -76,14 +85,23 @@ impl Default for JitterMetrics {
             late_packets: 0,
             invalid_packets: 0,
             output_underruns: 0,
+            startup_underruns: 0,
+            steady_underruns: 0,
+            missing_frame_calls: 0,
             missing_frames: 0,
             latency_trims: 0,
             trimmed_frames: 0,
             resyncs: 0,
+            resyncs_by_stream_change: 0,
+            resyncs_by_underrun: 0,
             latest_sequence: None,
             latest_sample_position: None,
             buffer_level_ms: 0.0,
+            audio_latency_ms: 0.0,
             resample_ratio: 1.0,
+            device_resample_ratio: 1.0,
+            correction_ppm: 0.0,
+            effective_resample_ratio: 1.0,
             estimated_drift_ppm: 0.0,
         }
     }
@@ -95,6 +113,12 @@ pub enum InsertOutcome {
     Duplicate,
     Late,
     Resynced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResyncReason {
+    StreamChange,
+    Underrun,
 }
 
 #[derive(Clone, Debug)]
@@ -148,7 +172,7 @@ impl JitterBuffer {
         let mut outcome = InsertOutcome::Accepted;
         if self.stream_id != Some(packet.header.stream_id) {
             if self.stream_id.is_some() {
-                self.clear_for_resync();
+                self.clear_for_resync(ResyncReason::StreamChange);
                 outcome = InsertOutcome::Resynced;
             }
             self.stream_id = Some(packet.header.stream_id);
@@ -206,6 +230,9 @@ impl JitterBuffer {
 
         self.maybe_start();
         if self.state != JitterState::Running {
+            if self.stream_id.is_some() {
+                self.metrics.startup_underruns += 1;
+            }
             self.refresh_metrics();
             return;
         }
@@ -214,7 +241,12 @@ impl JitterBuffer {
         let channels = self.config.channels as usize;
         let output_sample_rate = output_sample_rate.max(1);
         let device_resample_ratio = self.config.sample_rate as f32 / output_sample_rate as f32;
-        let ratio = self.compute_resample_ratio() * device_resample_ratio;
+        let correction_ppm = self.compute_correction_ppm();
+        let correction_ratio = 1.0 + correction_ppm / 1_000_000.0;
+        let ratio = correction_ratio * device_resample_ratio;
+        self.metrics.device_resample_ratio = device_resample_ratio;
+        self.metrics.correction_ppm = correction_ppm;
+        self.metrics.effective_resample_ratio = ratio;
         self.metrics.resample_ratio = ratio;
 
         let mut missing_in_call = 0u64;
@@ -248,16 +280,16 @@ impl JitterBuffer {
         }
 
         if missing_in_call > 0 {
+            self.metrics.missing_frame_calls += 1;
             self.metrics.missing_frames += missing_in_call;
             if self.buffer_level_frames() < 2 {
                 self.metrics.output_underruns += 1;
+                self.metrics.steady_underruns += 1;
                 self.state = JitterState::Priming;
                 self.read_pos = self.latest_received_end as f64;
                 self.consecutive_missing_frames = 0;
             } else if self.consecutive_missing_frames > self.config.sample_rate as u64 / 2 {
-                self.clear_for_resync();
-                self.state = JitterState::Resync;
-                self.metrics.resyncs += 1;
+                self.clear_for_resync(ResyncReason::Underrun);
             }
         }
 
@@ -280,7 +312,9 @@ impl JitterBuffer {
     pub fn metrics(&self) -> JitterMetrics {
         let mut metrics = self.metrics.clone();
         metrics.state = self.state;
-        metrics.buffer_level_ms = self.buffer_level_ms();
+        let audio_latency_ms = self.buffer_level_ms();
+        metrics.buffer_level_ms = audio_latency_ms;
+        metrics.audio_latency_ms = audio_latency_ms;
         metrics
     }
 
@@ -335,9 +369,9 @@ impl JitterBuffer {
         }
     }
 
-    fn compute_resample_ratio(&self) -> f32 {
+    fn compute_correction_ppm(&self) -> f32 {
         if !self.config.adaptive_resampling || self.state != JitterState::Running {
-            return 1.0;
+            return 0.0;
         }
 
         let error_ms = self.buffer_level_ms() - self.config.target_ms as f32;
@@ -346,8 +380,7 @@ impl JitterBuffer {
         } else {
             self.config.max_ppm
         };
-        let correction_ppm = (error_ms * self.config.kp).clamp(-max_ppm, max_ppm);
-        1.0 + correction_ppm / 1_000_000.0
+        (error_ms * self.config.kp).clamp(-max_ppm, max_ppm)
     }
 
     fn trim_excess_latency(&mut self) {
@@ -430,7 +463,7 @@ impl JitterBuffer {
             .unwrap_or(self.latest_received_end)
     }
 
-    fn clear_for_resync(&mut self) {
+    fn clear_for_resync(&mut self, reason: ResyncReason) {
         self.packets.clear();
         self.latest_received_end = 0;
         self.expected_sequence = None;
@@ -439,11 +472,17 @@ impl JitterBuffer {
         self.consecutive_missing_frames = 0;
         self.state = JitterState::Resync;
         self.metrics.resyncs += 1;
+        match reason {
+            ResyncReason::StreamChange => self.metrics.resyncs_by_stream_change += 1,
+            ResyncReason::Underrun => self.metrics.resyncs_by_underrun += 1,
+        }
     }
 
     fn refresh_metrics(&mut self) {
         self.metrics.state = self.state;
-        self.metrics.buffer_level_ms = self.buffer_level_ms();
+        let audio_latency_ms = self.buffer_level_ms();
+        self.metrics.buffer_level_ms = audio_latency_ms;
+        self.metrics.audio_latency_ms = audio_latency_ms;
     }
 
     fn buffer_level_frames(&self) -> u64 {
@@ -467,6 +506,10 @@ mod tests {
     use crate::packet::{AudioPacket, AudioPacketHeader};
 
     fn packet(sequence: u32, sample_position: u64) -> AudioPacket {
+        packet_for_stream(1, sequence, sample_position)
+    }
+
+    fn packet_for_stream(stream_id: u64, sequence: u32, sample_position: u64) -> AudioPacket {
         let frames = vec![
             StereoFrame {
                 left: 0.1,
@@ -476,7 +519,7 @@ mod tests {
         ];
         let payload = stereo_to_i16_interleaved(&frames);
         AudioPacket::new(
-            AudioPacketHeader::new(1, sequence, 240, sample_position, 0),
+            AudioPacketHeader::new(stream_id, sequence, 240, sample_position, 0),
             payload,
         )
         .unwrap()
@@ -516,6 +559,43 @@ mod tests {
             InsertOutcome::Duplicate
         );
         assert_eq!(buffer.metrics().duplicate_packets, 1);
+    }
+
+    #[test]
+    fn counts_priming_silence_separately_from_steady_underruns() {
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            start_threshold_ms: 20,
+            target_ms: 5,
+            ..JitterConfig::default()
+        });
+        buffer.insert_packet(packet(0, 0), Instant::now());
+
+        let mut out = vec![0.0; 240 * 2];
+        buffer.pull_f32(&mut out);
+
+        let metrics = buffer.metrics();
+        assert_eq!(metrics.state, JitterState::Priming);
+        assert_eq!(metrics.startup_underruns, 1);
+        assert_eq!(metrics.steady_underruns, 0);
+        assert_eq!(metrics.output_underruns, 0);
+    }
+
+    #[test]
+    fn reports_stream_change_resync_reason() {
+        let mut buffer = JitterBuffer::new(JitterConfig::default());
+        assert_eq!(
+            buffer.insert_packet(packet_for_stream(1, 0, 0), Instant::now()),
+            InsertOutcome::Accepted
+        );
+        assert_eq!(
+            buffer.insert_packet(packet_for_stream(2, 0, 0), Instant::now()),
+            InsertOutcome::Resynced
+        );
+
+        let metrics = buffer.metrics();
+        assert_eq!(metrics.resyncs, 1);
+        assert_eq!(metrics.resyncs_by_stream_change, 1);
+        assert_eq!(metrics.resyncs_by_underrun, 0);
     }
 
     #[test]
@@ -563,7 +643,12 @@ mod tests {
 
         assert_eq!(buffer.metrics().state, JitterState::Running);
         assert!((before - after - 10.0).abs() < 0.5);
-        assert!((buffer.metrics().resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
+        let metrics = buffer.metrics();
+        assert!((metrics.audio_latency_ms - metrics.buffer_level_ms).abs() < 0.001);
+        assert!((metrics.device_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
+        assert_eq!(metrics.correction_ppm, 0.0);
+        assert!((metrics.effective_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
+        assert!((metrics.resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
     }
 
     #[test]
