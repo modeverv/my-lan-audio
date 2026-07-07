@@ -13,6 +13,9 @@ pub struct JitterConfig {
     pub start_threshold_ms: u32,
     pub adaptive_resampling: bool,
     pub kp: f32,
+    pub ki: f32,
+    pub error_filter_alpha: f32,
+    pub integral_limit_ms_sec: f32,
     pub max_ppm: f32,
     pub emergency_max_ppm: f32,
 }
@@ -28,8 +31,11 @@ impl Default for JitterConfig {
             start_threshold_ms: 100,
             adaptive_resampling: true,
             kp: 5.0,
-            max_ppm: 100.0,
-            emergency_max_ppm: 500.0,
+            ki: 0.2,
+            error_filter_alpha: 0.05,
+            integral_limit_ms_sec: 1000.0,
+            max_ppm: 1000.0,
+            emergency_max_ppm: 5000.0,
         }
     }
 }
@@ -69,6 +75,9 @@ pub struct JitterMetrics {
     pub resample_ratio: f32,
     pub device_resample_ratio: f32,
     pub correction_ppm: f32,
+    pub buffer_error_ms: f32,
+    pub filtered_error_ms: f32,
+    pub integral_correction_ppm: f32,
     pub effective_resample_ratio: f32,
     pub estimated_drift_ppm: f32,
 }
@@ -101,6 +110,9 @@ impl Default for JitterMetrics {
             resample_ratio: 1.0,
             device_resample_ratio: 1.0,
             correction_ppm: 0.0,
+            buffer_error_ms: 0.0,
+            filtered_error_ms: 0.0,
+            integral_correction_ppm: 0.0,
             effective_resample_ratio: 1.0,
             estimated_drift_ppm: 0.0,
         }
@@ -139,6 +151,9 @@ pub struct JitterBuffer {
     first_drift_sample: Option<u64>,
     first_drift_arrival: Option<Instant>,
     consecutive_missing_frames: u64,
+    filtered_error_ms: f32,
+    error_filter_initialized: bool,
+    integral_error_ms_sec: f32,
     metrics: JitterMetrics,
 }
 
@@ -155,6 +170,9 @@ impl JitterBuffer {
             first_drift_sample: None,
             first_drift_arrival: None,
             consecutive_missing_frames: 0,
+            filtered_error_ms: 0.0,
+            error_filter_initialized: false,
+            integral_error_ms_sec: 0.0,
             metrics: JitterMetrics::default(),
         }
     }
@@ -240,8 +258,10 @@ impl JitterBuffer {
 
         let channels = self.config.channels as usize;
         let output_sample_rate = output_sample_rate.max(1);
+        let output_frames = output.len() / channels;
+        let output_duration_secs = output_frames as f32 / output_sample_rate as f32;
         let device_resample_ratio = self.config.sample_rate as f32 / output_sample_rate as f32;
-        let correction_ppm = self.compute_correction_ppm();
+        let correction_ppm = self.compute_correction_ppm(output_duration_secs);
         let correction_ratio = 1.0 + correction_ppm / 1_000_000.0;
         let ratio = correction_ratio * device_resample_ratio;
         self.metrics.device_resample_ratio = device_resample_ratio;
@@ -380,18 +400,43 @@ impl JitterBuffer {
         }
     }
 
-    fn compute_correction_ppm(&self) -> f32 {
+    fn compute_correction_ppm(&mut self, output_duration_secs: f32) -> f32 {
         if !self.config.adaptive_resampling || self.state != JitterState::Running {
             return 0.0;
         }
 
         let error_ms = self.buffer_level_ms() - self.config.target_ms as f32;
+        let alpha = self.config.error_filter_alpha.clamp(0.0, 1.0);
+        if self.error_filter_initialized {
+            self.filtered_error_ms += (error_ms - self.filtered_error_ms) * alpha;
+        } else {
+            self.filtered_error_ms = error_ms;
+            self.error_filter_initialized = true;
+        }
+
+        let integral_limit = self.config.integral_limit_ms_sec.max(0.0);
+        if integral_limit == 0.0 || self.config.ki == 0.0 {
+            self.integral_error_ms_sec = 0.0;
+        } else {
+            self.integral_error_ms_sec += self.filtered_error_ms * output_duration_secs.max(0.0);
+            self.integral_error_ms_sec = self
+                .integral_error_ms_sec
+                .clamp(-integral_limit, integral_limit);
+        }
+
+        let proportional_ppm = self.filtered_error_ms * self.config.kp;
+        let integral_ppm = self.integral_error_ms_sec * self.config.ki;
         let max_ppm = if error_ms.abs() > self.config.target_ms as f32 {
             self.config.emergency_max_ppm
         } else {
             self.config.max_ppm
         };
-        (error_ms * self.config.kp).clamp(-max_ppm, max_ppm)
+        let correction_ppm = (proportional_ppm + integral_ppm).clamp(-max_ppm, max_ppm);
+
+        self.metrics.buffer_error_ms = error_ms;
+        self.metrics.filtered_error_ms = self.filtered_error_ms;
+        self.metrics.integral_correction_ppm = integral_ppm;
+        correction_ppm
     }
 
     fn trim_excess_latency(&mut self) {
@@ -461,6 +506,9 @@ impl JitterBuffer {
         self.first_drift_sample = None;
         self.first_drift_arrival = None;
         self.consecutive_missing_frames = 0;
+        self.filtered_error_ms = 0.0;
+        self.error_filter_initialized = false;
+        self.integral_error_ms_sec = 0.0;
         self.state = JitterState::Resync;
         self.metrics.resyncs += 1;
         match reason {
@@ -686,6 +734,41 @@ mod tests {
         assert_eq!(metrics.correction_ppm, 0.0);
         assert!((metrics.effective_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
         assert!((metrics.resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn integral_correction_accumulates_for_persistent_latency_error() {
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            start_threshold_ms: 50,
+            target_ms: 50,
+            max_buffer_ms: 300,
+            kp: 0.0,
+            ki: 100.0,
+            error_filter_alpha: 1.0,
+            integral_limit_ms_sec: 20.0,
+            max_ppm: 1000.0,
+            emergency_max_ppm: 1000.0,
+            ..JitterConfig::default()
+        });
+        for sequence in 0..100 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+        }
+
+        let mut out = vec![0.0; 240 * 2];
+        buffer.pull_f32(&mut out);
+        assert_eq!(buffer.metrics().state, JitterState::Running);
+
+        for sequence in 100..120 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+        }
+        for _ in 0..10 {
+            buffer.pull_f32(&mut out);
+        }
+
+        let metrics = buffer.metrics();
+        assert!(metrics.buffer_error_ms > 0.0);
+        assert!(metrics.integral_correction_ppm > 0.0);
+        assert!(metrics.correction_ppm > 0.0);
     }
 
     #[test]

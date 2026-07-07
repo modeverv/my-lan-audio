@@ -58,10 +58,19 @@ struct Args {
     #[arg(long, default_value_t = 5.0)]
     kp: f32,
 
-    #[arg(long, default_value_t = 100.0)]
+    #[arg(long, default_value_t = 0.2)]
+    ki: f32,
+
+    #[arg(long, default_value_t = 0.05)]
+    error_filter_alpha: f32,
+
+    #[arg(long, default_value_t = 1000.0)]
+    integral_limit_ms_sec: f32,
+
+    #[arg(long, default_value_t = 1000.0)]
     max_ppm: f32,
 
-    #[arg(long, default_value_t = 500.0)]
+    #[arg(long, default_value_t = 5000.0)]
     emergency_max_ppm: f32,
 
     #[arg(long)]
@@ -111,6 +120,15 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.max_buffer_ms <= args.target_buffer_ms {
         bail!("--max-buffer-ms must be greater than --target-buffer-ms");
     }
+    if args.kp < 0.0 || args.ki < 0.0 {
+        bail!("--kp and --ki must be zero or greater");
+    }
+    if !(0.0..=1.0).contains(&args.error_filter_alpha) {
+        bail!("--error-filter-alpha must be between 0.0 and 1.0");
+    }
+    if args.integral_limit_ms_sec < 0.0 {
+        bail!("--integral-limit-ms-sec must be zero or greater");
+    }
     if args.output_buffer_size_frames == Some(0) {
         bail!("--output-buffer-size-frames must be greater than zero");
     }
@@ -136,6 +154,9 @@ fn run_receiver(args: &Args) -> Result<()> {
         start_threshold_ms: args.start_threshold_ms,
         adaptive_resampling: !args.no_adaptive_resampling,
         kp: args.kp,
+        ki: args.ki,
+        error_filter_alpha: args.error_filter_alpha,
+        integral_limit_ms_sec: args.integral_limit_ms_sec,
         max_ppm: args.max_ppm,
         emergency_max_ppm: args.emergency_max_ppm,
     })));
@@ -602,7 +623,7 @@ impl MetricsPrinter {
             .scratch_overflows
             .saturating_sub(self.last_callback_metrics.scratch_overflows);
         println!(
-            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms device_ratio={:.6} corr={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms err={:.1}ms filt={:.1}ms device_ratio={:.6} corr={:.1}ppm int={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             (metrics.lost_packets - previous.lost_packets) as f64 / elapsed,
@@ -611,8 +632,11 @@ impl MetricsPrinter {
             (metrics.out_of_order_packets - previous.out_of_order_packets) as f64 / elapsed,
             metrics.audio_latency_ms,
             target_ms,
+            metrics.buffer_error_ms,
+            metrics.filtered_error_ms,
             metrics.device_resample_ratio,
             metrics.correction_ppm,
+            metrics.integral_correction_ppm,
             metrics.effective_resample_ratio,
             metrics.estimated_drift_ppm,
             metrics.startup_underruns,
