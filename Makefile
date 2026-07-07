@@ -19,9 +19,6 @@ OUTPUT_BUFFER_SIZE_FRAMES ?= 128
 #OUTPUT_BUFFER_SIZE_FRAMES ?= 64
 PACKET_MS ?= 2.5
 METRICS_INTERVAL_SEC ?= 1
-RENICE ?= -10
-RENICE_CMD ?= sudo renice
-RENICE_DELAY_SEC ?= 0.2
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -38,65 +35,38 @@ help:
 	@printf '%s\n' '  RECEIVER_OUTPUT_DEVICE="SOUNDPEATS Space"'
 	@printf '%s\n' '  SENDER_INPUT_DEVICE="BlackHole"'
 	@printf '%s\n' '  TARGET_BUFFER_MS=20 OUTPUT_RING_MS=15 PACKET_MS=2.5'
-	@printf '%s\n' '  RENICE=-10  RENICE=0 disables renice; negative values usually require sudo'
 
 receive: receiver
 
 receiver:
-	mise exec -- cargo build -p receiver
-	@set -e; \
-	  target/debug/receiver \
-	    --listen $(AUDIO_ADDR) \
-	    --feedback-target $(FEEDBACK_ADDR) \
-	    --low-latency \
-	    --low-latency-trim-margin-ms 10 \
-	    --low-latency-trim-to-margin-ms 10 \
-	    --trim-crossfade-ms 1.5 \
-	    --realtime-renderer \
-	    --output audio \
-	    --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
-	    --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
-	    --target-buffer-ms $(TARGET_BUFFER_MS) \
-	    --start-threshold-ms $(START_THRESHOLD_MS) \
-	    --max-buffer-ms $(MAX_BUFFER_MS) \
-	    --output-ring-ms $(OUTPUT_RING_MS) \
-	    --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
-	    --render-chunk-ms $(RENDER_CHUNK_MS) \
-	    --metrics-interval-sec $(METRICS_INTERVAL_SEC) & \
-	  pid=$$!; \
-	  trap 'kill $$pid 2>/dev/null || true' INT TERM EXIT; \
-	  if [ -n "$(RENICE)" ] && [ "$(RENICE)" != "0" ]; then \
-	    sleep $(RENICE_DELAY_SEC); \
-	    printf '%s\n' "renice $(RENICE) pid=$$pid"; \
-	    $(RENICE_CMD) $(RENICE) -p $$pid >/dev/null || true; \
-	  fi; \
-	  wait $$pid; \
-	  status=$$?; \
-	  trap - INT TERM EXIT; \
-	  exit $$status
+	mise exec -- cargo run -p receiver -- \
+	  --listen $(AUDIO_ADDR) \
+	  --feedback-target $(FEEDBACK_ADDR) \
+	  --low-latency \
+	  --low-latency-trim-margin-ms 10 \
+	  --low-latency-trim-to-margin-ms 10 \
+	  --trim-crossfade-ms 1.5 \
+	  --realtime-renderer \
+	  --output audio \
+	  --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
+	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
+	  --target-buffer-ms $(TARGET_BUFFER_MS) \
+	  --start-threshold-ms $(START_THRESHOLD_MS) \
+	  --max-buffer-ms $(MAX_BUFFER_MS) \
+	  --output-ring-ms $(OUTPUT_RING_MS) \
+	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
+	  --render-chunk-ms $(RENDER_CHUNK_MS) \
+	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
 sender:
-	mise exec -- cargo build -p sender
-	@set -e; \
-	  target/debug/sender \
-	    --target $(AUDIO_ADDR) \
-	    --feedback-listen $(FEEDBACK_ADDR) \
-	    --input capture \
-	    --device "$(SENDER_INPUT_DEVICE)" \
-	    --packet-ms $(PACKET_MS) \
-	    --sender-side-asrc \
-	    --metrics-interval-sec $(METRICS_INTERVAL_SEC) & \
-	  pid=$$!; \
-	  trap 'kill $$pid 2>/dev/null || true' INT TERM EXIT; \
-	  if [ -n "$(RENICE)" ] && [ "$(RENICE)" != "0" ]; then \
-	    sleep $(RENICE_DELAY_SEC); \
-	    printf '%s\n' "renice $(RENICE) pid=$$pid"; \
-	    $(RENICE_CMD) $(RENICE) -p $$pid >/dev/null || true; \
-	  fi; \
-	  wait $$pid; \
-	  status=$$?; \
-	  trap - INT TERM EXIT; \
-	  exit $$status
+	mise exec -- cargo run -p sender -- \
+	  --target $(AUDIO_ADDR) \
+	  --feedback-listen $(FEEDBACK_ADDR) \
+	  --input capture \
+	  --device "$(SENDER_INPUT_DEVICE)" \
+	  --packet-ms $(PACKET_MS) \
+	  --sender-side-asrc \
+	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
 receiver-devices:
 	mise exec -- cargo run -p receiver -- --list-devices
