@@ -4,3 +4,4 @@
 *.jsonl
 .DS_Store
 memo.md
+.claude

@@ -1,23 +1,27 @@
 .PHONY: help receive receiver sender p-receiver p-sender release receiver-devices sender-devices build test check
 
-AUDIO_ADDR ?= 127.0.0.1:50000
-FEEDBACK_ADDR ?= 127.0.0.1:50001
+AUDIO_ADDR ?= 0.0.0.0:50000
+FEEDBACK_ADDR ?= 192.168.11.51:50001
+
+# TODO change to windows pc ip
+W_AUDIO_ADDR ?= 192.168.11.65:50000
+W_FEEDBACK_ADDR ?= 0.0.0.0:50001
 
 RECEIVER_OUTPUT_DEVICE ?= MacBook Proのスピーカー
 SENDER_INPUT_DEVICE ?= BlackHole 2ch
 
-TARGET_BUFFER_MS ?= 30
+TARGET_BUFFER_MS ?= 60
 #Target_BUFFER_MS ?= 15
-START_THRESHOLD_MS ?= 40
+START_THRESHOLD_MS ?= 80
 #START_THRESHOLD_MS ?= 20
-MAX_BUFFER_MS ?= 90
+MAX_BUFFER_MS ?= 180
 #MAX_BUFFER_MS ?= 40
 
-OUTPUT_RING_MS ?= 30
+OUTPUT_RING_MS ?= 60
 #OUTPUT_RING_MS ?= 10
-OUTPUT_RING_CAPACITY_MS ?= 80
+OUTPUT_RING_CAPACITY_MS ?= 160
 RENDER_CHUNK_MS ?= 2
-OUTPUT_BUFFER_SIZE_FRAMES ?= 128
+OUTPUT_BUFFER_SIZE_FRAMES ?= 256
 #OUTPUT_BUFFER_SIZE_FRAMES ?= 64
 PACKET_MS ?= 2.5
 METRICS_INTERVAL_SEC ?= 1
@@ -41,8 +45,6 @@ help:
 	@printf '%s\n' '  SENDER_INPUT_DEVICE="BlackHole"'
 	@printf '%s\n' '  TARGET_BUFFER_MS=20 OUTPUT_RING_MS=15 PACKET_MS=2.5'
 
-receive: receiver
-
 receiver:
 	mise exec -- cargo run -p receiver -- \
 	  --listen $(AUDIO_ADDR) \
@@ -63,6 +65,27 @@ receiver:
 	  --render-chunk-ms $(RENDER_CHUNK_MS) \
 	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
+p-receiver-tmp:
+	mise exec -- cargo build --release -p receiver
+	target/release/receiver \
+	  --listen $(AUDIO_ADDR) \
+	  --feedback-target $(FEEDBACK_ADDR) \
+	  --low-latency \
+	  --low-latency-trim-margin-ms 10 \
+	  --low-latency-trim-to-margin-ms 10 \
+	  --trim-crossfade-ms 1.5 \
+	  --realtime-renderer \
+	  --output audio \
+	  --output-device "BlackHole 2ch" \
+	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
+	  --target-buffer-ms $(TARGET_BUFFER_MS) \
+	  --start-threshold-ms $(START_THRESHOLD_MS) \
+	  --max-buffer-ms $(MAX_BUFFER_MS) \
+	  --output-ring-ms $(OUTPUT_RING_MS) \
+	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
+	  --render-chunk-ms $(RENDER_CHUNK_MS) \
+	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+
 sender:
 	mise exec -- cargo run -p sender -- \
 	  --target $(AUDIO_ADDR) \
@@ -72,6 +95,7 @@ sender:
 	  --packet-ms $(PACKET_MS) \
 	  --sender-side-asrc \
 	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+
 
 
 p-receiver:
@@ -107,11 +131,21 @@ p-sender:
 	  --sender-side-asrc \
 	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
+w-sender:
+	mise exec -- cargo build --release -p sender
+	target/release/sender \
+	  --target $(W_AUDIO_ADDR) \
+	  --feedback-listen $(W_FEEDBACK_ADDR) \
+	  --input capture \
+	  --device "$(SENDER_INPUT_DEVICE)" \
+	  --packet-ms $(PACKET_MS) \
+	  --sender-side-asrc \
+	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
-receiver-devices:
+receiver-list:
 	mise exec -- cargo run -p receiver -- --list-devices
 
-sender-devices:
+sender-list:
 	mise exec -- cargo run -p sender -- --list-devices
 
 build:
