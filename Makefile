@@ -6,12 +6,14 @@ FEEDBACK_ADDR ?= 127.0.0.1:50001
 RECEIVER_OUTPUT_DEVICE ?= MacBook Proのスピーカー
 SENDER_INPUT_DEVICE ?= BlackHole 2ch
 
-TARGET_BUFFER_MS ?= 15
-START_THRESHOLD_MS ?= 20
-MAX_BUFFER_MS ?= 45
+TARGET_BUFFER_MS ?= 30
+#Target_BUFFER_MS ?= 15
+START_THRESHOLD_MS ?= 40
+#START_THRESHOLD_MS ?= 20
+MAX_BUFFER_MS ?= 90
 #MAX_BUFFER_MS ?= 40
 
-OUTPUT_RING_MS ?= 15
+OUTPUT_RING_MS ?= 30
 #OUTPUT_RING_MS ?= 10
 OUTPUT_RING_CAPACITY_MS ?= 80
 RENDER_CHUNK_MS ?= 2
@@ -67,6 +69,37 @@ sender:
 	  --packet-ms $(PACKET_MS) \
 	  --sender-side-asrc \
 	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+
+
+p-receiver:
+	target/release/receiver \
+	  --listen $(AUDIO_ADDR) \
+	  --low-latency \
+	  --low-latency-trim-margin-ms 10 \
+	  --low-latency-trim-to-margin-ms 10 \
+	  --trim-crossfade-ms 1.5 \
+	  --realtime-renderer \
+	  --output audio \
+	  --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
+	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
+	  --target-buffer-ms $(TARGET_BUFFER_MS) \
+	  --start-threshold-ms $(START_THRESHOLD_MS) \
+	  --max-buffer-ms $(MAX_BUFFER_MS) \
+	  --output-ring-ms $(OUTPUT_RING_MS) \
+	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
+	  --render-chunk-ms $(RENDER_CHUNK_MS) \
+	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+
+
+p-sender:
+	target/release/sender \
+	  --target $(AUDIO_ADDR) \
+	  --input capture \
+	  --device "$(SENDER_INPUT_DEVICE)" \
+	  --packet-ms $(PACKET_MS) \
+	  --sender-side-asrc \
+	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+
 
 receiver-devices:
 	mise exec -- cargo run -p receiver -- --list-devices
