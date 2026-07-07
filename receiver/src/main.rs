@@ -15,7 +15,8 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -86,7 +87,7 @@ struct Args {
     #[arg(long)]
     output_buffer_size_frames: Option<u32>,
 
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 40)]
     output_ring_ms: u32,
 
     #[arg(long, default_value_t = 200)]
@@ -97,6 +98,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1_048_576)]
     socket_recv_buffer_bytes: usize,
+
+    #[arg(long, default_value_t = 2048)]
+    packet_queue_capacity: usize,
 
     #[arg(long)]
     duration_sec: Option<f64>,
@@ -154,6 +158,9 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.output_ring_capacity_ms < args.output_ring_ms + args.render_chunk_ms {
         bail!("--output-ring-capacity-ms must be at least --output-ring-ms + --render-chunk-ms");
     }
+    if args.packet_queue_capacity == 0 {
+        bail!("--packet-queue-capacity must be greater than zero");
+    }
     Ok(())
 }
 
@@ -167,7 +174,7 @@ fn run_receiver(args: &Args) -> Result<()> {
         args.target_buffer_ms
     );
 
-    let jitter = Arc::new(Mutex::new(JitterBuffer::new(JitterConfig {
+    let jitter_config = JitterConfig {
         sample_rate: args.sample_rate,
         channels: args.channels,
         capacity_ms: args.capacity_ms,
@@ -181,14 +188,37 @@ fn run_receiver(args: &Args) -> Result<()> {
         integral_limit_ms_sec: args.integral_limit_ms_sec,
         max_ppm: args.max_ppm,
         emergency_max_ppm: args.emergency_max_ppm,
-    })));
+    };
+    let (event_tx, event_rx) = sync_channel(args.packet_queue_capacity);
+    let ingress_metrics = Arc::new(IngressMetrics::default());
+    let receiver_state = Arc::new(ReceiverState::new(args.target_buffer_ms));
 
-    spawn_udp_receiver(socket, Arc::clone(&jitter));
+    spawn_udp_receiver(socket, event_tx, Arc::clone(&ingress_metrics));
 
     match output_mode(args).as_str() {
-        "audio" => run_audio_output(args, jitter),
-        "wav" => run_timed_pull_output(args, jitter, args.output_file.as_deref()),
-        "null" => run_timed_pull_output(args, jitter, None),
+        "audio" => run_audio_output(
+            args,
+            jitter_config,
+            event_rx,
+            receiver_state,
+            Arc::clone(&ingress_metrics),
+        ),
+        "wav" => run_timed_pull_output(
+            args,
+            jitter_config,
+            event_rx,
+            receiver_state,
+            Arc::clone(&ingress_metrics),
+            args.output_file.as_deref(),
+        ),
+        "null" => run_timed_pull_output(
+            args,
+            jitter_config,
+            event_rx,
+            receiver_state,
+            Arc::clone(&ingress_metrics),
+            None,
+        ),
         other => bail!("unsupported output mode {other}"),
     }
 }
@@ -214,7 +244,88 @@ fn bind_socket(addr: SocketAddr, recv_buffer_bytes: usize) -> Result<UdpSocket> 
     Ok(socket.into())
 }
 
-fn spawn_udp_receiver(socket: UdpSocket, jitter: Arc<Mutex<JitterBuffer>>) {
+enum ReceiverEvent {
+    Packet(AudioPacket, Instant),
+    InvalidPacket,
+}
+
+#[derive(Default)]
+struct IngressMetrics {
+    queued_packets: AtomicU64,
+    queued_invalid_packets: AtomicU64,
+    queue_drops: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IngressSnapshot {
+    queued_packets: u64,
+    queued_invalid_packets: u64,
+    queue_drops: u64,
+}
+
+impl IngressMetrics {
+    fn record_packet_queued(&self) {
+        self.queued_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_invalid_queued(&self) {
+        self.queued_invalid_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_queue_drop(&self) {
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> IngressSnapshot {
+        IngressSnapshot {
+            queued_packets: self.queued_packets.load(Ordering::Relaxed),
+            queued_invalid_packets: self.queued_invalid_packets.load(Ordering::Relaxed),
+            queue_drops: self.queue_drops.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReceiverSnapshot {
+    metrics: JitterMetrics,
+    target_ms: u32,
+}
+
+struct ReceiverState {
+    snapshot: Mutex<ReceiverSnapshot>,
+}
+
+impl ReceiverState {
+    fn new(target_ms: u32) -> Self {
+        Self {
+            snapshot: Mutex::new(ReceiverSnapshot {
+                metrics: JitterMetrics::default(),
+                target_ms,
+            }),
+        }
+    }
+
+    fn publish(&self, jitter: &JitterBuffer) {
+        let Ok(mut snapshot) = self.snapshot.try_lock() else {
+            return;
+        };
+        snapshot.metrics = jitter.metrics();
+        snapshot.target_ms = jitter.target_ms();
+    }
+
+    fn snapshot(&self) -> Option<ReceiverSnapshot> {
+        self.snapshot
+            .try_lock()
+            .ok()
+            .map(|snapshot| snapshot.clone())
+    }
+}
+
+fn spawn_udp_receiver(
+    socket: UdpSocket,
+    event_tx: SyncSender<ReceiverEvent>,
+    ingress_metrics: Arc<IngressMetrics>,
+) {
     thread::spawn(move || {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -223,15 +334,21 @@ fn spawn_udp_receiver(socket: UdpSocket, jitter: Arc<Mutex<JitterBuffer>>) {
                     let arrival = Instant::now();
                     match AudioPacket::from_bytes(&buf[..len]) {
                         Ok(packet) => {
-                            if let Ok(mut jitter) = jitter.lock() {
-                                jitter.insert_packet(packet, arrival);
-                            }
+                            send_receiver_event(
+                                &event_tx,
+                                ReceiverEvent::Packet(packet, arrival),
+                                &ingress_metrics,
+                                false,
+                            );
                         }
                         Err(err) => {
                             eprintln!("receiver: invalid packet: {err}");
-                            if let Ok(mut jitter) = jitter.lock() {
-                                jitter.record_invalid_packet();
-                            }
+                            send_receiver_event(
+                                &event_tx,
+                                ReceiverEvent::InvalidPacket,
+                                &ingress_metrics,
+                                true,
+                            );
                         }
                     }
                 }
@@ -241,11 +358,45 @@ fn spawn_udp_receiver(socket: UdpSocket, jitter: Arc<Mutex<JitterBuffer>>) {
     });
 }
 
+fn send_receiver_event(
+    event_tx: &SyncSender<ReceiverEvent>,
+    event: ReceiverEvent,
+    ingress_metrics: &IngressMetrics,
+    invalid: bool,
+) {
+    match event_tx.try_send(event) {
+        Ok(()) => {
+            if invalid {
+                ingress_metrics.record_invalid_queued();
+            } else {
+                ingress_metrics.record_packet_queued();
+            }
+        }
+        Err(TrySendError::Full(_)) => ingress_metrics.record_queue_drop(),
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+fn drain_receiver_events(event_rx: &Receiver<ReceiverEvent>, jitter: &mut JitterBuffer) {
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            ReceiverEvent::Packet(packet, arrival) => {
+                jitter.insert_packet(packet, arrival);
+            }
+            ReceiverEvent::InvalidPacket => jitter.record_invalid_packet(),
+        }
+    }
+}
+
 fn run_timed_pull_output(
     args: &Args,
-    jitter: Arc<Mutex<JitterBuffer>>,
+    jitter_config: JitterConfig,
+    event_rx: Receiver<ReceiverEvent>,
+    receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
     output_file: Option<&Path>,
 ) -> Result<()> {
+    let mut jitter = JitterBuffer::new(jitter_config);
     let chunk_frames = (args.sample_rate / 100) as usize;
     let channels = args.channels as usize;
     let mut writer = if let Some(path) = output_file {
@@ -263,9 +414,12 @@ fn run_timed_pull_output(
         feedback,
         args.sample_rate,
         args.channels,
+        Arc::clone(&receiver_state),
+        Arc::clone(&ingress_metrics),
     );
     let mut next_tick = Instant::now();
     let start = Instant::now();
+    let mut output = vec![0.0f32; chunk_frames * channels];
 
     loop {
         if duration_elapsed(start, args.duration_sec) {
@@ -275,10 +429,9 @@ fn run_timed_pull_output(
             return Ok(());
         }
 
-        let mut output = vec![0.0f32; chunk_frames * channels];
-        if let Ok(mut jitter) = jitter.lock() {
-            jitter.pull_f32(&mut output);
-        }
+        drain_receiver_events(&event_rx, &mut jitter);
+        jitter.pull_f32(&mut output);
+        receiver_state.publish(&jitter);
 
         if let Some(writer) = writer.as_mut() {
             for sample in &output {
@@ -286,13 +439,19 @@ fn run_timed_pull_output(
             }
         }
 
-        metrics.maybe_print(&jitter);
+        metrics.maybe_print();
         sleep_until(next_tick);
         next_tick += Duration::from_millis(10);
     }
 }
 
-fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()> {
+fn run_audio_output(
+    args: &Args,
+    jitter_config: JitterConfig,
+    event_rx: Receiver<ReceiverEvent>,
+    receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
+) -> Result<()> {
     let host = cpal::default_host();
     let device = select_output_device(&host, args.output_device.as_deref())?;
     let name = device.to_string();
@@ -317,13 +476,17 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
     let ring = Arc::new(SpscF32Ring::new(ring_capacity_samples));
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
     spawn_ring_renderer(
-        Arc::clone(&jitter),
+        jitter_config,
+        event_rx,
         Arc::clone(&ring),
         Arc::clone(&callback_metrics),
-        config.sample_rate,
-        channels,
-        args.output_ring_ms,
-        args.render_chunk_ms,
+        Arc::clone(&receiver_state),
+        RingRendererConfig {
+            output_sample_rate: config.sample_rate,
+            channels,
+            output_ring_ms: args.output_ring_ms,
+            render_chunk_ms: args.render_chunk_ms,
+        },
     );
     let stream = build_ring_output_stream(
         &device,
@@ -341,6 +504,8 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
         feedback,
         config.sample_rate,
         config.channels,
+        Arc::clone(&receiver_state),
+        Arc::clone(&ingress_metrics),
     );
     let start = Instant::now();
     loop {
@@ -348,7 +513,7 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
-        metrics.maybe_print(&jitter);
+        metrics.maybe_print();
     }
 }
 
@@ -453,28 +618,40 @@ fn build_ring_output_stream(
     Ok(stream)
 }
 
-fn spawn_ring_renderer(
-    jitter: Arc<Mutex<JitterBuffer>>,
-    ring: Arc<SpscF32Ring>,
-    metrics: Arc<OutputCallbackMetrics>,
+#[derive(Clone, Copy, Debug)]
+struct RingRendererConfig {
     output_sample_rate: u32,
     channels: usize,
     output_ring_ms: u32,
     render_chunk_ms: u32,
+}
+
+fn spawn_ring_renderer(
+    jitter_config: JitterConfig,
+    event_rx: Receiver<ReceiverEvent>,
+    ring: Arc<SpscF32Ring>,
+    metrics: Arc<OutputCallbackMetrics>,
+    receiver_state: Arc<ReceiverState>,
+    config: RingRendererConfig,
 ) {
     thread::spawn(move || {
-        let channels = channels.max(1);
-        let target_samples = samples_from_ms(output_sample_rate, channels, output_ring_ms);
-        let chunk_frames = (output_sample_rate as usize * render_chunk_ms as usize / 1000).max(1);
+        let mut jitter = JitterBuffer::new(jitter_config);
+        let channels = config.channels.max(1);
+        let target_samples =
+            samples_from_ms(config.output_sample_rate, channels, config.output_ring_ms);
+        let chunk_frames =
+            (config.output_sample_rate as usize * config.render_chunk_ms as usize / 1000).max(1);
         let mut render_scratch = vec![0.0f32; chunk_frames * channels];
         let sleep_duration =
-            Duration::from_micros(((render_chunk_ms as u64 * 1000) / 2).max(1_000));
+            Duration::from_micros(((config.render_chunk_ms as u64 * 1000) / 2).max(1_000));
 
         loop {
+            drain_receiver_events(&event_rx, &mut jitter);
             loop {
                 let queued = ring.len_samples();
                 metrics.record_output_queue_samples(queued);
                 if queued >= target_samples {
+                    metrics.mark_ring_ready();
                     break;
                 }
 
@@ -486,13 +663,7 @@ fn spawn_ring_renderer(
                 let sample_count = frames_to_render * channels;
                 let scratch = &mut render_scratch[..sample_count];
 
-                match jitter.try_lock() {
-                    Ok(mut jitter) => jitter.pull_f32_at_sample_rate(scratch, output_sample_rate),
-                    Err(_) => {
-                        metrics.record_renderer_lock_miss();
-                        break;
-                    }
-                }
+                jitter.pull_f32_at_sample_rate(scratch, config.output_sample_rate);
 
                 let pushed = ring.push_interleaved(scratch, channels);
                 if pushed < sample_count {
@@ -501,6 +672,7 @@ fn spawn_ring_renderer(
                 }
             }
 
+            receiver_state.publish(&jitter);
             thread::sleep(sleep_duration);
         }
     });
@@ -620,12 +792,17 @@ fn build_tone_output_stream(
         }
         SampleFormat::I16 => {
             let phase = phase.clone();
+            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
             device.build_output_stream(
                 *config,
                 move |data: &mut [i16], _| {
-                    let mut tmp = vec![0.0f32; data.len()];
-                    fill_tone_f32(&mut tmp, channels, sample_rate, freq, &phase);
-                    for (dst, src) in data.iter_mut().zip(tmp) {
+                    if data.len() > scratch.len() {
+                        data.fill(0);
+                        return;
+                    }
+                    let scratch = &mut scratch[..data.len()];
+                    fill_tone_f32(scratch, channels, sample_rate, freq, &phase);
+                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
                         *dst = f32_to_i16(src);
                     }
                 },
@@ -635,12 +812,17 @@ fn build_tone_output_stream(
         }
         SampleFormat::U16 => {
             let phase = phase.clone();
+            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
             device.build_output_stream(
                 *config,
                 move |data: &mut [u16], _| {
-                    let mut tmp = vec![0.0f32; data.len()];
-                    fill_tone_f32(&mut tmp, channels, sample_rate, freq, &phase);
-                    for (dst, src) in data.iter_mut().zip(tmp) {
+                    if data.len() > scratch.len() {
+                        data.fill(u16::MAX / 2);
+                        return;
+                    }
+                    let scratch = &mut scratch[..data.len()];
+                    fill_tone_f32(scratch, channels, sample_rate, freq, &phase);
+                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
                         *dst = f32_to_u16(src);
                     }
                 },
@@ -690,8 +872,8 @@ struct OutputCallbackMetrics {
     ring_underruns: AtomicU64,
     ring_missing_frames: AtomicU64,
     ring_overflows: AtomicU64,
-    renderer_lock_misses: AtomicU64,
     output_queue_samples: AtomicU64,
+    ring_ready: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -703,7 +885,6 @@ struct OutputCallbackSnapshot {
     ring_underruns: u64,
     ring_missing_frames: u64,
     ring_overflows: u64,
-    renderer_lock_misses: u64,
     output_queue_samples: u64,
 }
 
@@ -718,6 +899,9 @@ impl OutputCallbackMetrics {
     }
 
     fn record_ring_underrun(&self, missing_frames: usize) {
+        if !self.ring_ready.load(Ordering::Relaxed) {
+            return;
+        }
         self.ring_underruns.fetch_add(1, Ordering::Relaxed);
         self.ring_missing_frames
             .fetch_add(missing_frames as u64, Ordering::Relaxed);
@@ -728,13 +912,13 @@ impl OutputCallbackMetrics {
             .fetch_add(dropped_frames as u64, Ordering::Relaxed);
     }
 
-    fn record_renderer_lock_miss(&self) {
-        self.renderer_lock_misses.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn record_output_queue_samples(&self, samples: usize) {
         self.output_queue_samples
             .store(samples as u64, Ordering::Relaxed);
+    }
+
+    fn mark_ring_ready(&self) {
+        self.ring_ready.store(true, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> OutputCallbackSnapshot {
@@ -746,7 +930,6 @@ impl OutputCallbackMetrics {
             ring_underruns: self.ring_underruns.load(Ordering::Relaxed),
             ring_missing_frames: self.ring_missing_frames.load(Ordering::Relaxed),
             ring_overflows: self.ring_overflows.load(Ordering::Relaxed),
-            renderer_lock_misses: self.renderer_lock_misses.load(Ordering::Relaxed),
             output_queue_samples: self.output_queue_samples.load(Ordering::Relaxed),
         }
     }
@@ -785,11 +968,14 @@ struct MetricsPrinter {
     interval: Duration,
     last: Instant,
     last_metrics: Option<JitterMetrics>,
+    last_ingress: IngressSnapshot,
     callback_metrics: Option<Arc<OutputCallbackMetrics>>,
     last_callback_metrics: OutputCallbackSnapshot,
     feedback: Option<FeedbackSender>,
     output_sample_rate: u32,
     output_channels: u16,
+    receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
 }
 
 impl MetricsPrinter {
@@ -799,29 +985,34 @@ impl MetricsPrinter {
         feedback: Option<FeedbackSender>,
         output_sample_rate: u32,
         output_channels: u16,
+        receiver_state: Arc<ReceiverState>,
+        ingress_metrics: Arc<IngressMetrics>,
     ) -> Self {
         Self {
             interval: Duration::from_secs_f64(interval_sec.max(0.1)),
             last: Instant::now(),
             last_metrics: None,
+            last_ingress: IngressSnapshot::default(),
             callback_metrics,
             last_callback_metrics: OutputCallbackSnapshot::default(),
             feedback,
             output_sample_rate,
             output_channels,
+            receiver_state,
+            ingress_metrics,
         }
     }
 
-    fn maybe_print(&mut self, jitter: &Arc<Mutex<JitterBuffer>>) {
+    fn maybe_print(&mut self) {
         if self.last.elapsed() < self.interval {
             return;
         }
-        let Ok(jitter) = jitter.try_lock() else {
+        let Some(snapshot) = self.receiver_state.snapshot() else {
             return;
         };
-        let metrics = jitter.metrics();
-        let target_ms = jitter.target_ms();
-        drop(jitter);
+        let metrics = snapshot.metrics;
+        let target_ms = snapshot.target_ms;
+        let ingress = self.ingress_metrics.snapshot();
 
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let previous = self.last_metrics.clone().unwrap_or_default();
@@ -832,6 +1023,15 @@ impl MetricsPrinter {
             .unwrap_or_default();
         let trimmed_frames = metrics.trimmed_frames - previous.trimmed_frames;
         let trimmed_ms_per_sec = trimmed_frames as f64 * 1000.0 / SAMPLE_RATE as f64 / elapsed;
+        let queue_drop_delta = ingress
+            .queue_drops
+            .saturating_sub(self.last_ingress.queue_drops);
+        let queued_packet_delta = ingress
+            .queued_packets
+            .saturating_sub(self.last_ingress.queued_packets);
+        let queued_invalid_delta = ingress
+            .queued_invalid_packets
+            .saturating_sub(self.last_ingress.queued_invalid_packets);
         let callback_delta = callback_metrics
             .callbacks
             .saturating_sub(self.last_callback_metrics.callbacks);
@@ -853,16 +1053,16 @@ impl MetricsPrinter {
         let ring_overflow_delta = callback_metrics
             .ring_overflows
             .saturating_sub(self.last_callback_metrics.ring_overflows);
-        let renderer_lock_miss_delta = callback_metrics
-            .renderer_lock_misses
-            .saturating_sub(self.last_callback_metrics.renderer_lock_misses);
         let output_queue_ms = callback_metrics.output_queue_samples as f64 * 1000.0
             / self.output_sample_rate.max(1) as f64
             / self.output_channels.max(1) as f64;
         println!(
-            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms outq={:.1}ms err={:.1}ms filt={:.1}ms device_ratio={:.6} corr={:.1}ppm int={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s renderer_lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms outq={:.1}ms err={:.1}ms filt={:.1}ms device_ratio={:.6} corr={:.1}ppm int={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
+            queued_packet_delta as f64 / elapsed,
+            queue_drop_delta as f64 / elapsed,
+            queued_invalid_delta as f64 / elapsed,
             (metrics.lost_packets - previous.lost_packets) as f64 / elapsed,
             (metrics.late_packets - previous.late_packets) as f64 / elapsed,
             (metrics.duplicate_packets - previous.duplicate_packets) as f64 / elapsed,
@@ -884,7 +1084,6 @@ impl MetricsPrinter {
             callback_delta as f64 / elapsed,
             callback_frames_delta as f64 / elapsed,
             lock_miss_delta as f64 / elapsed,
-            renderer_lock_miss_delta as f64 / elapsed,
             ring_underrun_delta as f64 / elapsed,
             ring_missing_delta as f64 / elapsed,
             ring_overflow_delta as f64 / elapsed,
@@ -911,6 +1110,7 @@ impl MetricsPrinter {
                 scratch_overflows: callback_metrics.scratch_overflows,
                 ring_underruns: callback_metrics.ring_underruns,
                 ring_missing_frames: callback_metrics.ring_missing_frames,
+                packet_queue_drops: ingress.queue_drops,
                 audio_latency_ms: metrics.audio_latency_ms,
                 output_queue_ms: output_queue_ms as f32,
                 correction_ppm: metrics.correction_ppm,
@@ -921,6 +1121,7 @@ impl MetricsPrinter {
 
         self.last = Instant::now();
         self.last_metrics = Some(metrics);
+        self.last_ingress = ingress;
         self.last_callback_metrics = callback_metrics;
     }
 }

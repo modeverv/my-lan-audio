@@ -44,11 +44,13 @@ sender:
 
 したがって、まず metrics を分解しないと、`underruns` の数字だけでは安定性の評価に使いにくい。
 
-## Current Structural Weak Points
+## Original Structural Weak Points
 
-### 1. Audio callback が `Mutex<JitterBuffer>` に依存している
+以下は localhost underrun を見た時点の構造レビュー。現在の実装状況は後半の "Implemented Progress" に追記している。
 
-現状 receiver の CoreAudio callback は `try_lock()` で jitter buffer を読む。
+### 1. Audio callback が `Mutex<JitterBuffer>` に依存していた
+
+当初の receiver の CoreAudio callback は `try_lock()` で jitter buffer を読んでいた。
 
 ```text
 audio callback
@@ -61,15 +63,15 @@ audio callback
 
 さらに、現状この lock miss は `output_underruns` として正確に数えていない。つまり、無音が出ても metrics に出ない可能性がある。
 
-### 2. Audio callback 内で `BTreeMap` を sample ごとに探索している
+### 2. Audio callback 内で `BTreeMap` を sample ごとに探索していた
 
-現状 `JitterBuffer::sample_at()` は `BTreeMap::range(..=position).next_back()` を使う。callback 内で output frame ごとにこの検索が走る。
+当初の `JitterBuffer::sample_at()` は `BTreeMap::range(..=position).next_back()` を使っていた。callback 内で output frame ごとにこの検索が走る。
 
 これは分かりやすい実装だが、リアルタイム callback には重い。localhost で packet が完璧でも、callback 処理が詰まると underrun / glitch になる。
 
-### 3. Callback 内の allocation path が残っている
+### 3. Callback 内の allocation path が残っていた
 
-`U16` output や `I16` output では callback 内で一時 `Vec<f32>` を作る経路がある。現在の MacBook / BlackHole / SOUNDPEATS は主に `F32` なので踏みにくいが、安定版では callback 内 allocation は避けるべき。
+`U16` output や `I16` output では callback 内で一時 `Vec<f32>` を作る経路があった。現在の MacBook / BlackHole / SOUNDPEATS は主に `F32` なので踏みにくいが、安定版では callback 内 allocation は避けるべき。
 
 ### 4. Startup / steady-state の metrics が混ざっている
 
@@ -459,20 +461,27 @@ P0:
   - audio_latency_ms 名を追加
   - resyncs_by_stream_change / resyncs_by_underrun を追加
 
-P1 partial:
+P1:
   - I16/U16 callback の一時 Vec allocation を事前確保scratchへ移行
+  - test tone の I16/U16 callback allocation も事前確保scratchへ移行
+  - timed/null/wav output loop の一時 Vec allocation もループ外scratchへ移行
   - callback内のBTreeMap lookupをpacket cacheで軽量化
   - lock miss / scratch overflow時に即ゼロではなくlast frameを保持
   - output buffer sizeを --output-buffer-size-frames で固定指定可能にした
   - audio callbackをSPSC ring読み取り専用にし、Mutex<JitterBuffer> / BTreeMapから切り離した
   - renderer threadがJitterBufferから短いchunkを生成してoutput ringへpushする構造にした
-  - output ringの outq / ring_under / ring_missing / renderer_lock_miss をmetrics化した
+  - UDP receive threadはpacket eventをbounded channelへ流し、renderer/timed outputがJitterBufferを単独所有する構造にした
+  - receiver source上から Mutex<JitterBuffer> / Arc<Mutex<JitterBuffer>> を排除した
+  - output ringの outq / ring_under / ring_missing / ring_overflow をmetrics化した
+  - output ringが一度targetまでprimingされる前のring underrunはsteady指標から除外した
+  - --output-ring-ms のdefaultを20msから40msへ上げ、macOS thread schedulingの余裕を増やした
+  - UDP receive -> renderer channel の queued / qdrop / qinvalid をmetrics化した
 
 P2:
   - receiver --feedback-target で ReceiverStatus UDP を送信
-  - sender --feedback-listen で remote_latency / remote_outq / remote_ring_under / remote_steady_under / remote_lock_miss / remote_ratio を表示
+  - sender --feedback-listen で remote_latency / remote_outq / remote_ring_under / remote_qdrop / remote_steady_under / remote_lock_miss / remote_ratio を表示
 
-P3 partial:
+P3 receiver-side:
   - receiver-only ASRCをP制御から低速PI制御へ拡張
   - error_filter_alpha / ki / integral_limit_ms_sec を調整可能にした
   - max_ppm / emergency_max_ppm のdefaultを実用寄りに上げた
@@ -488,12 +497,15 @@ P3 partial:
 - receiver -> sender feedbackで sender側に remote_latency=70.0ms remote_ratio=0.999995 が表示されることを確認
 ```
 
-残る構造課題:
+現在の運用メモ:
 
 ```text
-- audio callbackから Mutex<JitterBuffer> / BTreeMap は外れた
-- ただし renderer thread と UDP receive thread はまだ同じ JitterBuffer を Mutex 経由で共有している
-- renderer_lock_miss が増える場合は、UDP receive -> renderer の間も channel / ownership分離する必要がある
+- receiver本線のcallbackから allocation / Mutex<JitterBuffer> / BTreeMap は外れた
+- renderer thread と UDP receive thread の間も channel / ownership分離済み
+- receiver source上に Mutex<JitterBuffer> / Arc<Mutex<JitterBuffer>> は残っていない
+- qdrop が増える場合は --packet-queue-capacity を上げるか、renderer側のchunk/睡眠間隔を再調整する
+- ring_under が増える場合は --output-ring-ms を40ms以上に保つか、低遅延目的で20msへ下げた場合だけmacOS schedulingの揺れとして評価する
+- remote_lock_miss は古いstatus/ログ互換の観測項目として残るが、現在のreceiver audio pathでは増えない想定
 ```
 
-次の本命は、UDP受信threadがpacketをchannelへ送り、renderer threadがJitterBufferを単独所有する形にして、renderer側のMutexも消すこと。
+ここまでで、localhost underrun 対策として先に潰すべき receiver 側のRT安全性は一通り実装済み。sender-side ASRC / pacing と pull model は未採用の別設計案として残すが、これは安定化の小修正ではなくプロトコル制御を含む別段階の設計変更として扱う。

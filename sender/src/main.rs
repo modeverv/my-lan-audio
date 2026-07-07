@@ -255,12 +255,13 @@ impl MetricsPrinter {
             return " remote_status=waiting".to_string();
         };
         format!(
-            " remote_latency={:.1}ms remote_outq={:.1}ms remote_target={}ms remote_steady_under={} remote_ring_under={} remote_lock_miss={} remote_trims={} remote_resyncs={} remote_ratio={:.6}",
+            " remote_latency={:.1}ms remote_outq={:.1}ms remote_target={}ms remote_steady_under={} remote_ring_under={} remote_qdrop={} remote_lock_miss={} remote_trims={} remote_resyncs={} remote_ratio={:.6}",
             status.audio_latency_ms,
             status.output_queue_ms,
             status.target_ms,
             status.steady_underruns,
             status.ring_underruns,
+            status.packet_queue_drops,
             status.callback_lock_misses,
             status.latency_trims,
             status.resyncs,

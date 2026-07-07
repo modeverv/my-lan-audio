@@ -2,7 +2,7 @@ use std::fmt;
 
 pub const STATUS_MAGIC: [u8; 4] = *b"W2MS";
 pub const STATUS_VERSION: u16 = 1;
-pub const STATUS_SIZE: usize = 128;
+pub const STATUS_SIZE: usize = 136;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReceiverStatus {
@@ -19,6 +19,7 @@ pub struct ReceiverStatus {
     pub scratch_overflows: u64,
     pub ring_underruns: u64,
     pub ring_missing_frames: u64,
+    pub packet_queue_drops: u64,
     pub audio_latency_ms: f32,
     pub output_queue_ms: f32,
     pub correction_ppm: f32,
@@ -46,6 +47,7 @@ impl ReceiverStatus {
         write_u64(&mut out, self.scratch_overflows);
         write_u64(&mut out, self.ring_underruns);
         write_u64(&mut out, self.ring_missing_frames);
+        write_u64(&mut out, self.packet_queue_drops);
         write_f32(&mut out, self.audio_latency_ms);
         write_f32(&mut out, self.output_queue_ms);
         write_f32(&mut out, self.correction_ppm);
@@ -89,6 +91,7 @@ impl ReceiverStatus {
         let scratch_overflows = read_u64(bytes, &mut cursor)?;
         let ring_underruns = read_u64(bytes, &mut cursor)?;
         let ring_missing_frames = read_u64(bytes, &mut cursor)?;
+        let packet_queue_drops = read_u64(bytes, &mut cursor)?;
         let audio_latency_ms = read_f32(bytes, &mut cursor)?;
         let output_queue_ms = read_f32(bytes, &mut cursor)?;
         let correction_ppm = read_f32(bytes, &mut cursor)?;
@@ -109,6 +112,7 @@ impl ReceiverStatus {
             scratch_overflows,
             ring_underruns,
             ring_missing_frames,
+            packet_queue_drops,
             audio_latency_ms,
             output_queue_ms,
             correction_ppm,
@@ -238,6 +242,7 @@ mod tests {
             scratch_overflows: 6,
             ring_underruns: 7,
             ring_missing_frames: 8,
+            packet_queue_drops: 9,
             audio_latency_ms: 78.5,
             output_queue_ms: 19.5,
             correction_ppm: 12.25,
