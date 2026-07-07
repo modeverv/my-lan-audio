@@ -446,3 +446,51 @@ P3:
 localhostで packet loss がないのに underrun / resync が見える場合、主原因はネットワークではなく receiver のリアルタイム処理構造か、startup metrics の混在である可能性が高い。
 
 次に実装するなら、いきなり clock exchange で制御を複雑にするより、まず receiver の audio callback をRT安全にし、metricsを分解するのが最も効果が高い。その上で receiver status feedback を足すと、clock drift と latency の制御に進める。
+
+## Implemented Progress
+
+2026-07-07 時点で以下を実装済み。
+
+```text
+P0:
+  - startup_underruns / steady_underruns / missing_frame_calls を分離
+  - callback_lock_misses / scratch_overflow を receiver log に追加
+  - device_ratio / correction_ppm / effective_ratio を分離表示
+  - audio_latency_ms 名を追加
+  - resyncs_by_stream_change / resyncs_by_underrun を追加
+
+P1 partial:
+  - I16/U16 callback の一時 Vec allocation を事前確保scratchへ移行
+  - callback内のBTreeMap lookupをpacket cacheで軽量化
+  - lock miss / scratch overflow時に即ゼロではなくlast frameを保持
+  - output buffer sizeを --output-buffer-size-frames で固定指定可能にした
+
+P2:
+  - receiver --feedback-target で ReceiverStatus UDP を送信
+  - sender --feedback-listen で remote_latency / remote_steady_under / remote_lock_miss / remote_ratio を表示
+
+P3 partial:
+  - receiver-only ASRCをP制御から低速PI制御へ拡張
+  - error_filter_alpha / ki / integral_limit_ms_sec を調整可能にした
+  - max_ppm / emergency_max_ppm のdefaultを実用寄りに上げた
+```
+
+短時間確認:
+
+```text
+- cargo fmt --all -- --check: pass
+- cargo test: pass
+- cargo clippy --all-targets -- -D warnings: pass
+- MacBook Proのスピーカーへの無音audio outputで cb ~= 94/s, out_frames ~= 48k/s を確認
+- receiver -> sender feedbackで sender側に remote_latency=70.0ms remote_ratio=0.999995 が表示されることを確認
+```
+
+まだ残る大きな構造課題:
+
+```text
+- audio callback はまだ Mutex<JitterBuffer> を try_lock している
+- UDP thread と audio callback が同じ JitterBuffer を共有している
+- callback 経路から BTreeMap を完全には排除できていない
+```
+
+次の本命は、UDP受信・reorder・jitter管理をcallback外へ移し、audio callback は事前確保されたSPSC ringから読むだけにすること。
