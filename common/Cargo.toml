@@ -1,0 +1,10 @@
+[package]
+name = "lan-audio-common"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "lan_audio_common"
+path = "src/lib.rs"
+

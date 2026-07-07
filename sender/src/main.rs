@@ -1,0 +1,699 @@
+use anyhow::{anyhow, bail, Context, Result};
+use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{SampleFormat, Stream, StreamConfig};
+use hound::{SampleFormat as WavSampleFormat, WavReader, WavSpec, WavWriter};
+use lan_audio_common::audio::{
+    f32_to_i16, i16_to_f32, rms_db, stereo_to_i16_interleaved, StereoFrame, CHANNELS, SAMPLE_RATE,
+};
+use lan_audio_common::packet::{AudioPacket, AudioPacketHeader};
+use lan_audio_common::resampler::{resample_linear, StreamingLinearResampler};
+use rand::Rng;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::BufWriter;
+use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Parser, Debug)]
+#[command(about = "LAN audio UDP sender")]
+struct Args {
+    #[arg(long, default_value = "127.0.0.1:50000")]
+    target: SocketAddr,
+
+    #[arg(long, default_value = "0.0.0.0:0")]
+    bind: SocketAddr,
+
+    #[arg(long, default_value = "sine", value_parser = ["dummy", "sine", "capture"])]
+    input: String,
+
+    #[arg(long)]
+    input_file: Option<PathBuf>,
+
+    #[arg(long)]
+    device: Option<String>,
+
+    #[arg(long)]
+    list_devices: bool,
+
+    #[arg(long)]
+    meter_only: bool,
+
+    #[arg(long)]
+    output_file: Option<PathBuf>,
+
+    #[arg(long, default_value_t = SAMPLE_RATE)]
+    sample_rate: u32,
+
+    #[arg(long, default_value_t = CHANNELS)]
+    channels: u16,
+
+    #[arg(long, default_value_t = 5)]
+    packet_ms: u32,
+
+    #[arg(long, default_value_t = 440.0)]
+    freq: f32,
+
+    #[arg(long)]
+    duration_sec: Option<f64>,
+
+    #[arg(long)]
+    loop_input: bool,
+
+    #[arg(long, default_value_t = 0.0)]
+    drop_rate: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    jitter_ms: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    reorder_rate: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    drift_ppm: f64,
+
+    #[arg(long, default_value_t = 1.0)]
+    metrics_interval_sec: f64,
+}
+
+#[derive(Debug, Default)]
+struct SendStats {
+    sent_packets: u64,
+    sent_bytes: u64,
+    dropped_packets: u64,
+    send_errors: u64,
+}
+
+struct PacketSender {
+    socket: UdpSocket,
+    target: SocketAddr,
+    stream_id: u64,
+    sequence: u32,
+    sample_position: u64,
+    start: Instant,
+    stats: SendStats,
+    pending_reorder: VecDeque<Vec<u8>>,
+    drop_rate: f64,
+    jitter_ms: f64,
+    reorder_rate: f64,
+}
+
+impl PacketSender {
+    fn new(args: &Args) -> Result<Self> {
+        let socket = UdpSocket::bind(args.bind)
+            .with_context(|| format!("failed to bind UDP socket to {}", args.bind))?;
+
+        Ok(Self {
+            socket,
+            target: args.target,
+            stream_id: new_stream_id(),
+            sequence: 0,
+            sample_position: 0,
+            start: Instant::now(),
+            stats: SendStats::default(),
+            pending_reorder: VecDeque::new(),
+            drop_rate: args.drop_rate.clamp(0.0, 1.0),
+            jitter_ms: args.jitter_ms.max(0.0),
+            reorder_rate: args.reorder_rate.clamp(0.0, 1.0),
+        })
+    }
+
+    fn send_frames(&mut self, frames: &[StereoFrame]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let payload = stereo_to_i16_interleaved(frames);
+        let header = AudioPacketHeader::new(
+            self.stream_id,
+            self.sequence,
+            frames.len() as u16,
+            self.sample_position,
+            self.start.elapsed().as_nanos() as u64,
+        );
+        let packet = AudioPacket::new(header, payload)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sample_position += frames.len() as u64;
+        self.send_bytes(packet.to_bytes())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        while let Some(bytes) = self.pending_reorder.pop_front() {
+            self.send_now(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        let mut rng = rand::thread_rng();
+        if rng.gen::<f64>() < self.drop_rate {
+            self.stats.dropped_packets += 1;
+            return Ok(());
+        }
+
+        if self.jitter_ms > 0.0 {
+            let delay_ms = rng.gen_range(0.0..=self.jitter_ms);
+            thread::sleep(Duration::from_secs_f64(delay_ms / 1000.0));
+        }
+
+        if rng.gen::<f64>() < self.reorder_rate {
+            if let Some(previous) = self.pending_reorder.pop_front() {
+                self.send_now(&bytes)?;
+                self.send_now(&previous)?;
+            } else {
+                self.pending_reorder.push_back(bytes);
+            }
+            return Ok(());
+        }
+
+        if let Some(previous) = self.pending_reorder.pop_front() {
+            self.send_now(&previous)?;
+        }
+        self.send_now(&bytes)
+    }
+
+    fn send_now(&mut self, bytes: &[u8]) -> Result<()> {
+        match self.socket.send_to(bytes, self.target) {
+            Ok(sent) => {
+                self.stats.sent_packets += 1;
+                self.stats.sent_bytes += sent as u64;
+                Ok(())
+            }
+            Err(err) => {
+                self.stats.send_errors += 1;
+                Err(err).with_context(|| format!("failed to send UDP packet to {}", self.target))
+            }
+        }
+    }
+}
+
+struct MetricsPrinter {
+    interval: Duration,
+    last: Instant,
+    last_packets: u64,
+    last_bytes: u64,
+}
+
+impl MetricsPrinter {
+    fn new(interval_sec: f64) -> Self {
+        Self {
+            interval: Duration::from_secs_f64(interval_sec.max(0.1)),
+            last: Instant::now(),
+            last_packets: 0,
+            last_bytes: 0,
+        }
+    }
+
+    fn maybe_print(&mut self, sender: &PacketSender, label: &str, rms: (f32, f32), buffer_ms: f32) {
+        if self.last.elapsed() < self.interval {
+            return;
+        }
+
+        let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
+        let packets = sender.stats.sent_packets - self.last_packets;
+        let bytes = sender.stats.sent_bytes - self.last_bytes;
+        let bitrate_mbps = bytes as f64 * 8.0 / elapsed / 1_000_000.0;
+        println!(
+            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={}",
+            packets as f64 / elapsed,
+            bitrate_mbps,
+            sender.sequence,
+            sender.sample_position,
+            buffer_ms,
+            rms.0,
+            rms.1,
+            sender.stats.dropped_packets,
+            sender.stats.send_errors
+        );
+
+        self.last = Instant::now();
+        self.last_packets = sender.stats.sent_packets;
+        self.last_bytes = sender.stats.sent_bytes;
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    validate_audio_args(&args)?;
+
+    if args.list_devices {
+        return list_input_devices();
+    }
+
+    if args.meter_only || args.output_file.is_some() {
+        return run_capture_monitor(&args);
+    }
+
+    if let Some(path) = &args.input_file {
+        return run_file_sender(&args, path);
+    }
+
+    match args.input.as_str() {
+        "dummy" => run_generated_sender(&args, GeneratedInput::Dummy),
+        "sine" => run_generated_sender(&args, GeneratedInput::Sine),
+        "capture" => run_capture_sender(&args),
+        other => bail!("unsupported input mode {other}"),
+    }
+}
+
+fn validate_audio_args(args: &Args) -> Result<()> {
+    if args.sample_rate != SAMPLE_RATE {
+        bail!("only 48000Hz is supported by the packet format today");
+    }
+    if args.channels != CHANNELS {
+        bail!("only stereo output is supported by the packet format today");
+    }
+    if args.packet_ms == 0 {
+        bail!("--packet-ms must be greater than zero");
+    }
+    let packet_frames = packet_frames(args)?;
+    if packet_frames > u16::MAX as usize {
+        bail!("packet has too many frames for the protocol header");
+    }
+    Ok(())
+}
+
+fn packet_frames(args: &Args) -> Result<usize> {
+    let frames = args.sample_rate as u64 * args.packet_ms as u64 / 1000;
+    if frames == 0 {
+        bail!("--packet-ms is too small for {}Hz", args.sample_rate);
+    }
+    Ok(frames as usize)
+}
+
+enum GeneratedInput {
+    Dummy,
+    Sine,
+}
+
+fn run_generated_sender(args: &Args, input: GeneratedInput) -> Result<()> {
+    let packet_frames = packet_frames(args)?;
+    let mut sender = PacketSender::new(args)?;
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let start = Instant::now();
+    let mut next_tick = Instant::now();
+    let interval = packet_interval(args);
+    let mut phase = 0.0f32;
+    let phase_step = args.freq * std::f32::consts::TAU / args.sample_rate as f32;
+    let label = match input {
+        GeneratedInput::Dummy => "dummy",
+        GeneratedInput::Sine => "sine",
+    };
+
+    loop {
+        if duration_elapsed(start, args.duration_sec) {
+            sender.flush()?;
+            return Ok(());
+        }
+
+        let mut frames = Vec::with_capacity(packet_frames);
+        for _ in 0..packet_frames {
+            let frame = match input {
+                GeneratedInput::Dummy => StereoFrame::SILENCE,
+                GeneratedInput::Sine => {
+                    let sample = (phase.sin() * 0.2).clamp(-1.0, 1.0);
+                    phase = (phase + phase_step) % std::f32::consts::TAU;
+                    StereoFrame {
+                        left: sample,
+                        right: sample,
+                    }
+                }
+            };
+            frames.push(frame);
+        }
+        let rms = rms_db(&frames);
+        sender.send_frames(&frames)?;
+        metrics.maybe_print(&sender, label, rms, 0.0);
+        sleep_until(next_tick);
+        next_tick += interval;
+    }
+}
+
+fn run_file_sender(args: &Args, path: &Path) -> Result<()> {
+    let packet_frames = packet_frames(args)?;
+    let frames = load_wav_as_stereo(path, args.sample_rate)
+        .with_context(|| format!("failed to read WAV input {}", path.display()))?;
+    if frames.is_empty() {
+        bail!("input WAV contains no samples");
+    }
+
+    let mut sender = PacketSender::new(args)?;
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let start = Instant::now();
+    let mut next_tick = Instant::now();
+    let interval = packet_interval(args);
+    let mut cursor = 0usize;
+
+    loop {
+        if duration_elapsed(start, args.duration_sec) {
+            sender.flush()?;
+            return Ok(());
+        }
+
+        if cursor >= frames.len() {
+            if args.loop_input {
+                cursor = 0;
+            } else {
+                sender.flush()?;
+                return Ok(());
+            }
+        }
+
+        let mut packet = Vec::with_capacity(packet_frames);
+        while packet.len() < packet_frames {
+            if cursor >= frames.len() {
+                if args.loop_input {
+                    cursor = 0;
+                } else {
+                    packet.resize(packet_frames, StereoFrame::SILENCE);
+                    break;
+                }
+            }
+            let remaining = packet_frames - packet.len();
+            let take = remaining.min(frames.len() - cursor);
+            packet.extend_from_slice(&frames[cursor..cursor + take]);
+            cursor += take;
+        }
+
+        let rms = rms_db(&packet);
+        sender.send_frames(&packet)?;
+        metrics.maybe_print(&sender, "wav", rms, 0.0);
+        sleep_until(next_tick);
+        next_tick += interval;
+    }
+}
+
+fn run_capture_sender(args: &Args) -> Result<()> {
+    let packet_frames = packet_frames(args)?;
+    let (stream, rx, source_rate) = open_capture_stream(args)?;
+    stream.play().context("failed to start input stream")?;
+
+    println!(
+        "capture_started=true target={} source_rate={}",
+        args.target, source_rate
+    );
+    let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
+    let mut sender = PacketSender::new(args)?;
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let mut pending = Vec::new();
+    let start = Instant::now();
+    let mut latest_rms = (-120.0, -120.0);
+
+    loop {
+        if duration_elapsed(start, args.duration_sec) {
+            sender.flush()?;
+            return Ok(());
+        }
+
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                latest_rms = rms_db(&chunk);
+                let mut resampled = Vec::new();
+                resampler.push(&chunk, &mut resampled);
+                pending.extend(resampled);
+                while pending.len() >= packet_frames {
+                    let packet: Vec<_> = pending.drain(..packet_frames).collect();
+                    sender.send_frames(&packet)?;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(err) => return Err(err).context("capture stream stopped"),
+        }
+        let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
+        metrics.maybe_print(&sender, "capture", latest_rms, pending_ms);
+    }
+}
+
+fn run_capture_monitor(args: &Args) -> Result<()> {
+    let (stream, rx, source_rate) = open_capture_stream(args)?;
+    stream.play().context("failed to start input stream")?;
+
+    let mut writer = if let Some(path) = &args.output_file {
+        Some(
+            create_wav_writer(path, args.sample_rate)
+                .with_context(|| format!("failed to create {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
+    let start = Instant::now();
+    let mut last = Instant::now();
+    let interval = Duration::from_secs_f64(args.metrics_interval_sec.max(0.1));
+    let mut captured_frames = 0u64;
+    let mut latest_rms = (-120.0, -120.0);
+
+    println!(
+        "capture_started=true source_rate={source_rate} output_file={:?}",
+        args.output_file
+    );
+    loop {
+        if duration_elapsed(start, args.duration_sec) {
+            if let Some(writer) = writer {
+                writer.finalize().context("failed to finalize WAV output")?;
+            }
+            return Ok(());
+        }
+
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                latest_rms = rms_db(&chunk);
+                let mut resampled = Vec::new();
+                resampler.push(&chunk, &mut resampled);
+                captured_frames += resampled.len() as u64;
+                if let Some(writer) = writer.as_mut() {
+                    for frame in &resampled {
+                        writer.write_sample(f32_to_i16(frame.left))?;
+                        writer.write_sample(f32_to_i16(frame.right))?;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(err) => return Err(err).context("capture stream stopped"),
+        }
+
+        if last.elapsed() >= interval {
+            println!(
+                "sender: meter frames={} rms={:.1}/{:.1}dB",
+                captured_frames, latest_rms.0, latest_rms.1
+            );
+            last = Instant::now();
+        }
+    }
+}
+
+fn open_capture_stream(args: &Args) -> Result<(Stream, Receiver<Vec<StereoFrame>>, u32)> {
+    let host = cpal::default_host();
+    let device = select_input_device(&host, args.device.as_deref())?;
+    let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let supported = device
+        .default_input_config()
+        .context("failed to get default input config")?;
+    let sample_format = supported.sample_format();
+    let config = supported.config();
+    let source_rate = config.sample_rate.0;
+    let source_channels = config.channels as usize;
+    let (tx, rx) = sync_channel::<Vec<StereoFrame>>(32);
+
+    println!(
+        "selected_device=\"{}\" input_format={}Hz/{}ch/{:?}",
+        device_name, source_rate, source_channels, sample_format
+    );
+
+    let stream = build_input_stream(&device, sample_format, &config, source_channels, tx)?;
+    Ok((stream, rx, source_rate))
+}
+
+fn build_input_stream(
+    device: &cpal::Device,
+    sample_format: SampleFormat,
+    config: &StreamConfig,
+    channels: usize,
+    tx: SyncSender<Vec<StereoFrame>>,
+) -> Result<Stream> {
+    let err_fn = |err| eprintln!("audio input stream error: {err}");
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let tx = tx.clone();
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _| {
+                    let _ = tx.try_send(input_f32_to_stereo(data, channels));
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let tx = tx.clone();
+            device.build_input_stream(
+                config,
+                move |data: &[i16], _| {
+                    let _ = tx.try_send(input_i16_to_stereo(data, channels));
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let tx = tx.clone();
+            device.build_input_stream(
+                config,
+                move |data: &[u16], _| {
+                    let _ = tx.try_send(input_u16_to_stereo(data, channels));
+                },
+                err_fn,
+                None,
+            )?
+        }
+        other => bail!("unsupported input sample format {other:?}"),
+    };
+    Ok(stream)
+}
+
+fn input_f32_to_stereo(data: &[f32], channels: usize) -> Vec<StereoFrame> {
+    data.chunks_exact(channels)
+        .map(|frame| {
+            let left = frame[0].clamp(-1.0, 1.0);
+            let right = frame.get(1).copied().unwrap_or(left).clamp(-1.0, 1.0);
+            StereoFrame { left, right }
+        })
+        .collect()
+}
+
+fn input_i16_to_stereo(data: &[i16], channels: usize) -> Vec<StereoFrame> {
+    data.chunks_exact(channels)
+        .map(|frame| {
+            let left = i16_to_f32(frame[0]);
+            let right = frame.get(1).copied().map(i16_to_f32).unwrap_or(left);
+            StereoFrame { left, right }
+        })
+        .collect()
+}
+
+fn input_u16_to_stereo(data: &[u16], channels: usize) -> Vec<StereoFrame> {
+    data.chunks_exact(channels)
+        .map(|frame| {
+            let left = u16_to_f32(frame[0]);
+            let right = frame.get(1).copied().map(u16_to_f32).unwrap_or(left);
+            StereoFrame { left, right }
+        })
+        .collect()
+}
+
+fn u16_to_f32(sample: u16) -> f32 {
+    sample as f32 / 65535.0 * 2.0 - 1.0
+}
+
+fn select_input_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::Device> {
+    if let Some(filter) = filter {
+        let filter = filter.to_lowercase();
+        for device in host.input_devices()? {
+            let name = device.name().unwrap_or_default();
+            if name.to_lowercase().contains(&filter) {
+                return Ok(device);
+            }
+        }
+        bail!("input device containing {filter:?} was not found");
+    }
+
+    host.default_input_device()
+        .ok_or_else(|| anyhow!("default input device was not found"))
+}
+
+fn list_input_devices() -> Result<()> {
+    let host = cpal::default_host();
+    for (index, device) in host.input_devices()?.enumerate() {
+        let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+        let default = device
+            .default_input_config()
+            .map(|config| {
+                format!(
+                    "{}Hz/{}ch/{:?}",
+                    config.sample_rate().0,
+                    config.channels(),
+                    config.sample_format()
+                )
+            })
+            .unwrap_or_else(|err| format!("no default config: {err}"));
+        println!("{index}: {name} [{default}]");
+    }
+    Ok(())
+}
+
+fn load_wav_as_stereo(path: &Path, target_rate: u32) -> Result<Vec<StereoFrame>> {
+    let mut reader = WavReader::open(path)?;
+    let spec = reader.spec();
+    let source_channels = spec.channels as usize;
+    if source_channels == 0 {
+        bail!("WAV has zero channels");
+    }
+
+    let samples = match spec.sample_format {
+        WavSampleFormat::Int if spec.bits_per_sample <= 16 => reader
+            .samples::<i16>()
+            .map(|sample| sample.map(i16_to_f32))
+            .collect::<Result<Vec<_>, _>>()?,
+        WavSampleFormat::Int => {
+            let scale = ((1i64 << (spec.bits_per_sample - 1)) - 1) as f32;
+            reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|value| (value as f32 / scale).clamp(-1.0, 1.0)))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        WavSampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|sample| sample.map(|value| value.clamp(-1.0, 1.0)))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    let frames: Vec<_> = samples
+        .chunks_exact(source_channels)
+        .map(|frame| {
+            let left = frame[0];
+            let right = frame.get(1).copied().unwrap_or(left);
+            StereoFrame { left, right }
+        })
+        .collect();
+
+    Ok(resample_linear(&frames, spec.sample_rate, target_rate))
+}
+
+fn create_wav_writer(path: &Path, sample_rate: u32) -> Result<WavWriter<BufWriter<File>>> {
+    let spec = WavSpec {
+        channels: CHANNELS,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: WavSampleFormat::Int,
+    };
+    Ok(WavWriter::create(path, spec)?)
+}
+
+fn packet_interval(args: &Args) -> Duration {
+    let nominal = args.packet_ms as f64 / 1000.0;
+    let speed = 1.0 + args.drift_ppm / 1_000_000.0;
+    Duration::from_secs_f64(nominal / speed.max(0.0001))
+}
+
+fn duration_elapsed(start: Instant, duration_sec: Option<f64>) -> bool {
+    duration_sec
+        .map(|duration| start.elapsed() >= Duration::from_secs_f64(duration.max(0.0)))
+        .unwrap_or(false)
+}
+
+fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if deadline > now {
+        thread::sleep(deadline - now);
+    }
+}
+
+fn new_stream_id() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (now as u64) ^ ((now >> 64) as u64)
+}
