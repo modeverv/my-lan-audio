@@ -56,8 +56,8 @@ struct Args {
     #[arg(long, default_value_t = CHANNELS)]
     channels: u16,
 
-    #[arg(long, default_value_t = 5)]
-    packet_ms: u32,
+    #[arg(long, default_value_t = 5.0)]
+    packet_ms: f64,
 
     #[arg(long, default_value_t = 440.0)]
     freq: f32,
@@ -79,6 +79,15 @@ struct Args {
 
     #[arg(long, default_value_t = 0.0)]
     drift_ppm: f64,
+
+    #[arg(long)]
+    sender_side_asrc: bool,
+
+    #[arg(long, default_value_t = 40.0)]
+    sender_asrc_kp: f64,
+
+    #[arg(long, default_value_t = 1000.0)]
+    sender_asrc_max_ppm: f64,
 
     #[arg(long, default_value_t = 1.0)]
     metrics_interval_sec: f64,
@@ -215,7 +224,14 @@ impl MetricsPrinter {
         }
     }
 
-    fn maybe_print(&mut self, sender: &PacketSender, label: &str, rms: (f32, f32), buffer_ms: f32) {
+    fn maybe_print(
+        &mut self,
+        sender: &PacketSender,
+        label: &str,
+        rms: (f32, f32),
+        buffer_ms: f32,
+        send_rate_ppm: f64,
+    ) {
         if self.last.elapsed() < self.interval {
             return;
         }
@@ -226,7 +242,7 @@ impl MetricsPrinter {
         let bitrate_mbps = bytes as f64 * 8.0 / elapsed / 1_000_000.0;
         let remote_suffix = self.remote_suffix();
         println!(
-            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={}{}",
+            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={} send_corr={:.1}ppm{}",
             packets as f64 / elapsed,
             bitrate_mbps,
             sender.sequence,
@@ -236,6 +252,7 @@ impl MetricsPrinter {
             rms.1,
             sender.stats.dropped_packets,
             sender.stats.send_errors,
+            send_rate_ppm,
             remote_suffix
         );
 
@@ -303,8 +320,11 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.channels != CHANNELS {
         bail!("only stereo output is supported by the packet format today");
     }
-    if args.packet_ms == 0 {
+    if args.packet_ms <= 0.0 {
         bail!("--packet-ms must be greater than zero");
+    }
+    if args.sender_asrc_kp < 0.0 || args.sender_asrc_max_ppm < 0.0 {
+        bail!("--sender-asrc-kp and --sender-asrc-max-ppm must be zero or greater");
     }
     let packet_frames = packet_frames(args)?;
     if packet_frames > u16::MAX as usize {
@@ -343,12 +363,31 @@ fn spawn_feedback_listener(listen: Option<SocketAddr>) -> Result<Option<SharedRe
     Ok(Some(status))
 }
 
+fn sender_side_asrc_ppm(args: &Args, remote_status: &Option<SharedReceiverStatus>) -> f64 {
+    if !args.sender_side_asrc {
+        return 0.0;
+    }
+
+    let Some(remote_status) = remote_status else {
+        return 0.0;
+    };
+    let Ok(status) = remote_status.try_lock() else {
+        return 0.0;
+    };
+    let Some(status) = status.as_ref() else {
+        return 0.0;
+    };
+
+    let error_ms = status.audio_latency_ms as f64 - status.target_ms as f64;
+    (-error_ms * args.sender_asrc_kp).clamp(-args.sender_asrc_max_ppm, args.sender_asrc_max_ppm)
+}
+
 fn packet_frames(args: &Args) -> Result<usize> {
-    let frames = args.sample_rate as u64 * args.packet_ms as u64 / 1000;
+    let frames = (args.sample_rate as f64 * args.packet_ms / 1000.0).round() as usize;
     if frames == 0 {
         bail!("--packet-ms is too small for {}Hz", args.sample_rate);
     }
-    Ok(frames as usize)
+    Ok(frames)
 }
 
 enum GeneratedInput {
@@ -363,10 +402,9 @@ fn run_generated_sender(
 ) -> Result<()> {
     let packet_frames = packet_frames(args)?;
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone());
     let start = Instant::now();
     let mut next_tick = Instant::now();
-    let interval = packet_interval(args);
     let mut phase = 0.0f32;
     let phase_step = args.freq * std::f32::consts::TAU / args.sample_rate as f32;
     let label = match input {
@@ -397,9 +435,10 @@ fn run_generated_sender(
         }
         let rms = rms_db(&frames);
         sender.send_frames(&frames)?;
-        metrics.maybe_print(&sender, label, rms, 0.0);
+        let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
+        metrics.maybe_print(&sender, label, rms, 0.0, send_rate_ppm);
         sleep_until(next_tick);
-        next_tick += interval;
+        next_tick += packet_interval(args, send_rate_ppm);
     }
 }
 
@@ -416,10 +455,9 @@ fn run_file_sender(
     }
 
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone());
     let start = Instant::now();
     let mut next_tick = Instant::now();
-    let interval = packet_interval(args);
     let mut cursor = 0usize;
 
     loop {
@@ -455,9 +493,10 @@ fn run_file_sender(
 
         let rms = rms_db(&packet);
         sender.send_frames(&packet)?;
-        metrics.maybe_print(&sender, "wav", rms, 0.0);
+        let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
+        metrics.maybe_print(&sender, "wav", rms, 0.0, send_rate_ppm);
         sleep_until(next_tick);
-        next_tick += interval;
+        next_tick += packet_interval(args, send_rate_ppm);
     }
 }
 
@@ -472,7 +511,7 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
     );
     let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone());
     let mut pending = Vec::new();
     let start = Instant::now();
     let mut latest_rms = (-120.0, -120.0);
@@ -486,6 +525,10 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
                 latest_rms = rms_db(&chunk);
+                let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
+                let effective_target_rate =
+                    args.sample_rate as f64 * (1.0 + send_rate_ppm / 1_000_000.0).max(0.0001);
+                resampler.set_effective_target_rate(source_rate, effective_target_rate);
                 let mut resampled = Vec::new();
                 resampler.push(&chunk, &mut resampled);
                 pending.extend(resampled);
@@ -498,7 +541,8 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
             Err(err) => return Err(err).context("capture stream stopped"),
         }
         let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-        metrics.maybe_print(&sender, "capture", latest_rms, pending_ms);
+        let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
+        metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
     }
 }
 
@@ -747,9 +791,9 @@ fn create_wav_writer(path: &Path, sample_rate: u32) -> Result<WavWriter<BufWrite
     Ok(WavWriter::create(path, spec)?)
 }
 
-fn packet_interval(args: &Args) -> Duration {
-    let nominal = args.packet_ms as f64 / 1000.0;
-    let speed = 1.0 + args.drift_ppm / 1_000_000.0;
+fn packet_interval(args: &Args, send_rate_ppm: f64) -> Duration {
+    let nominal = args.packet_ms / 1000.0;
+    let speed = 1.0 + (args.drift_ppm + send_rate_ppm) / 1_000_000.0;
     Duration::from_secs_f64(nominal / speed.max(0.0001))
 }
 

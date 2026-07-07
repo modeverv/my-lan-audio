@@ -85,6 +85,21 @@ struct Args {
     no_adaptive_resampling: bool,
 
     #[arg(long)]
+    low_latency: bool,
+
+    #[arg(long, default_value_t = 10)]
+    low_latency_trim_margin_ms: u32,
+
+    #[arg(long, default_value_t = 10)]
+    low_latency_trim_to_margin_ms: u32,
+
+    #[arg(long, default_value_t = 1.5)]
+    trim_crossfade_ms: f32,
+
+    #[arg(long)]
+    realtime_renderer: bool,
+
+    #[arg(long)]
     output_buffer_size_frames: Option<u32>,
 
     #[arg(long, default_value_t = 40)]
@@ -152,6 +167,15 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.output_buffer_size_frames == Some(0) {
         bail!("--output-buffer-size-frames must be greater than zero");
     }
+    if args.low_latency_trim_margin_ms == 0 {
+        bail!("--low-latency-trim-margin-ms must be greater than zero");
+    }
+    if args.low_latency_trim_to_margin_ms > args.low_latency_trim_margin_ms {
+        bail!("--low-latency-trim-to-margin-ms must be less than or equal to --low-latency-trim-margin-ms");
+    }
+    if args.trim_crossfade_ms < 0.0 {
+        bail!("--trim-crossfade-ms must be zero or greater");
+    }
     if args.output_ring_ms == 0 || args.output_ring_capacity_ms == 0 || args.render_chunk_ms == 0 {
         bail!("output ring and render chunk timing values must be greater than zero");
     }
@@ -188,6 +212,10 @@ fn run_receiver(args: &Args) -> Result<()> {
         integral_limit_ms_sec: args.integral_limit_ms_sec,
         max_ppm: args.max_ppm,
         emergency_max_ppm: args.emergency_max_ppm,
+        low_latency: args.low_latency,
+        low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
+        low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
+        trim_crossfade_ms: args.trim_crossfade_ms,
     };
     let (event_tx, event_rx) = sync_channel(args.packet_queue_capacity);
     let ingress_metrics = Arc::new(IngressMetrics::default());
@@ -486,6 +514,8 @@ fn run_audio_output(
             channels,
             output_ring_ms: args.output_ring_ms,
             render_chunk_ms: args.render_chunk_ms,
+            low_latency: args.low_latency,
+            realtime_priority: args.low_latency || args.realtime_renderer,
         },
     );
     let stream = build_ring_output_stream(
@@ -624,6 +654,8 @@ struct RingRendererConfig {
     channels: usize,
     output_ring_ms: u32,
     render_chunk_ms: u32,
+    low_latency: bool,
+    realtime_priority: bool,
 }
 
 fn spawn_ring_renderer(
@@ -634,49 +666,76 @@ fn spawn_ring_renderer(
     receiver_state: Arc<ReceiverState>,
     config: RingRendererConfig,
 ) {
-    thread::spawn(move || {
-        let mut jitter = JitterBuffer::new(jitter_config);
-        let channels = config.channels.max(1);
-        let target_samples =
-            samples_from_ms(config.output_sample_rate, channels, config.output_ring_ms);
-        let chunk_frames =
-            (config.output_sample_rate as usize * config.render_chunk_ms as usize / 1000).max(1);
-        let mut render_scratch = vec![0.0f32; chunk_frames * channels];
-        let sleep_duration =
-            Duration::from_micros(((config.render_chunk_ms as u64 * 1000) / 2).max(1_000));
-
-        loop {
-            drain_receiver_events(&event_rx, &mut jitter);
-            loop {
-                let queued = ring.len_samples();
-                metrics.record_output_queue_samples(queued);
-                if queued >= target_samples {
-                    metrics.mark_ring_ready();
-                    break;
-                }
-
-                let missing_samples = target_samples - queued;
-                let frames_to_render = (missing_samples / channels).min(chunk_frames);
-                if frames_to_render == 0 {
-                    break;
-                }
-                let sample_count = frames_to_render * channels;
-                let scratch = &mut render_scratch[..sample_count];
-
-                jitter.pull_f32_at_sample_rate(scratch, config.output_sample_rate);
-
-                let pushed = ring.push_interleaved(scratch, channels);
-                if pushed < sample_count {
-                    metrics.record_ring_overflow((sample_count - pushed) / channels);
-                    break;
-                }
+    let spawn_result = thread::Builder::new()
+        .name("receiver-ring-renderer".to_string())
+        .spawn(move || {
+            if config.realtime_priority {
+                raise_renderer_thread_priority();
             }
+            let mut jitter = JitterBuffer::new(jitter_config);
+            let channels = config.channels.max(1);
+            let target_samples =
+                samples_from_ms(config.output_sample_rate, channels, config.output_ring_ms);
+            let chunk_frames =
+                (config.output_sample_rate as usize * config.render_chunk_ms as usize / 1000)
+                    .max(1);
+            let mut render_scratch = vec![0.0f32; chunk_frames * channels];
+            let sleep_divisor = if config.low_latency { 4 } else { 2 };
+            let min_sleep_us = if config.low_latency { 500 } else { 1_000 };
+            let sleep_duration = Duration::from_micros(
+                ((config.render_chunk_ms as u64 * 1000) / sleep_divisor).max(min_sleep_us),
+            );
 
-            receiver_state.publish(&jitter);
-            thread::sleep(sleep_duration);
-        }
-    });
+            loop {
+                drain_receiver_events(&event_rx, &mut jitter);
+                loop {
+                    let queued = ring.len_samples();
+                    metrics.record_output_queue_samples(queued);
+                    if queued >= target_samples {
+                        metrics.mark_ring_ready();
+                        break;
+                    }
+
+                    let missing_samples = target_samples - queued;
+                    let frames_to_render = (missing_samples / channels).min(chunk_frames);
+                    if frames_to_render == 0 {
+                        break;
+                    }
+                    let sample_count = frames_to_render * channels;
+                    let scratch = &mut render_scratch[..sample_count];
+
+                    jitter.pull_f32_at_sample_rate(scratch, config.output_sample_rate);
+
+                    let pushed = ring.push_interleaved(scratch, channels);
+                    if pushed < sample_count {
+                        metrics.record_ring_overflow((sample_count - pushed) / channels);
+                        break;
+                    }
+                }
+
+                receiver_state.publish(&jitter);
+                thread::sleep(sleep_duration);
+            }
+        });
+
+    if let Err(err) = spawn_result {
+        eprintln!("receiver: failed to spawn ring renderer thread: {err}");
+    }
 }
+
+#[cfg(target_os = "macos")]
+fn raise_renderer_thread_priority() {
+    unsafe {
+        let result =
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        if result != 0 {
+            eprintln!("receiver: failed to raise renderer thread QoS: {result}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raise_renderer_thread_priority() {}
 
 fn update_last_frame(samples: &[f32], channels: usize, last_frame: &mut [f32]) {
     if samples.len() < channels || last_frame.len() < channels {

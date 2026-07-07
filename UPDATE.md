@@ -476,6 +476,12 @@ P1:
   - output ringが一度targetまでprimingされる前のring underrunはsteady指標から除外した
   - --output-ring-ms のdefaultを20msから40msへ上げ、macOS thread schedulingの余裕を増やした
   - UDP receive -> renderer channel の queued / qdrop / qinvalid をmetrics化した
+  - --low-latency で target + margin 超過時に max_buffer を待たず hard trim するようにした
+  - hard trim後は target ぴったりではなく target + trim_to_margin へ戻し、output ring充填後に薄くなりすぎる状態を避ける
+  - hard trim 時に短い trim_crossfade を入れ、clickを抑える経路を追加した
+  - low-latency時は renderer sleepを短縮し、macOSではrenderer thread QoSを上げる
+  - sender --packet-ms を小数対応にし、2.5ms packetを使えるようにした
+  - sender --sender-side-asrc で receiver feedback に応じて送出rate / capture resampler targetを微調整する
 
 P2:
   - receiver --feedback-target で ReceiverStatus UDP を送信
@@ -508,4 +514,4 @@ P3 receiver-side:
 - remote_lock_miss は古いstatus/ログ互換の観測項目として残るが、現在のreceiver audio pathでは増えない想定
 ```
 
-ここまでで、localhost underrun 対策として先に潰すべき receiver 側のRT安全性は一通り実装済み。sender-side ASRC / pacing と pull model は未採用の別設計案として残すが、これは安定化の小修正ではなくプロトコル制御を含む別段階の設計変更として扱う。
+ここまでで、localhost underrun 対策として先に潰すべき receiver 側のRT安全性と、feedback を使った sender-side ASRC / pacing の初期実装は完了。pull model や PTP などの明示的な network clock sync は未採用の別設計案として残すが、これは安定化の小修正ではなくプロトコル制御を含む別段階の設計変更として扱う。

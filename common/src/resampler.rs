@@ -49,6 +49,18 @@ impl StreamingLinearResampler {
         }
     }
 
+    pub fn set_ratio(&mut self, ratio: f64) {
+        if ratio.is_finite() && ratio > 0.0 {
+            self.ratio = ratio;
+        }
+    }
+
+    pub fn set_effective_target_rate(&mut self, source_rate: u32, target_rate: f64) {
+        if source_rate > 0 && target_rate.is_finite() && target_rate > 0.0 {
+            self.set_ratio(source_rate as f64 / target_rate);
+        }
+    }
+
     pub fn push(&mut self, input: &[StereoFrame], output: &mut Vec<StereoFrame>) {
         if (self.ratio - 1.0).abs() < f64::EPSILON && self.buffer.is_empty() {
             output.extend_from_slice(input);

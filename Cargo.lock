@@ -667,6 +667,7 @@ dependencies = [
  "cpal",
  "hound",
  "lan-audio-common",
+ "libc",
  "socket2",
 ]
 

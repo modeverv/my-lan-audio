@@ -26,8 +26,8 @@
 
 未採用の大きな設計案:
 
-- sender-side ASRC / pacing
 - receiver clock master の pull model
+- PTP などによる明示的な network clock sync
 - Dante / AES67 / RTP / PTP 互換
 - 暗号化、認証、複数送信元、マルチキャスト
 
@@ -251,9 +251,9 @@ mise exec -- cargo run -p sender -- \
 - システム出力を BlackHole にすると、通常のスピーカーからは直接音が出なくなります。このアプリの receiver がスピーカーへ戻す役割になります。
 - feedback port は audio port と別です。上の例では audio が `50000`, feedback が `50001` です。
 
-### 30ms 目標の Makefile shortcut
+### 低遅延 Makefile shortcut
 
-localhost で攻めた設定を試す場合は、receiver を先に起動してから sender を起動します。
+localhost で低遅延設定を試す場合は、receiver を先に起動してから sender を起動します。Makefile の既定値は、アプリ内部遅延をおおむね `target 20ms + output ring 10ms` に寄せる設定です。
 
 Terminal 1:
 
@@ -267,22 +267,28 @@ Terminal 2:
 make sender
 ```
 
+`make receive` も `make receiver` の alias です。
+
 既定値は以下です。
 
 ```text
-receiver output device: MacBook
-sender input device: BlackHole
+receiver output device: MacBook Proのスピーカー
+sender input device: BlackHole 2ch
 audio: 127.0.0.1:50000
 feedback: 127.0.0.1:50001
-target-buffer-ms: 30
-output-ring-ms: 20
+target-buffer-ms: 20
+output-ring-ms: 15
+output-buffer-size-frames: 128
+packet-ms: 2.5
+receiver low-latency hard trim: enabled
+sender-side ASRC: enabled
 ```
 
 デバイス名や buffer は make 変数で上書きできます。
 
 ```bash
-make receiver RECEIVER_OUTPUT_DEVICE="SOUNDPEATS Space" TARGET_BUFFER_MS=40 OUTPUT_RING_MS=30
-make sender SENDER_INPUT_DEVICE="BlackHole"
+make receiver RECEIVER_OUTPUT_DEVICE="SOUNDPEATS Space" TARGET_BUFFER_MS=30 OUTPUT_RING_MS=20
+make sender SENDER_INPUT_DEVICE="BlackHole" PACKET_MS=5
 ```
 
 ## Windows -> macOS
@@ -408,6 +414,9 @@ mise exec -- cargo run -p sender -- \
 --sample-rate <HZ>               packet sample rate。現在は48000のみ
 --channels <N>                   channel数。現在は2のみ
 --packet-ms <MS>                 packet duration。default: 5
+--sender-side-asrc               receiver feedbackでsender送出レートを微調整
+--sender-asrc-kp <K>             sender-side ASRCの比例係数
+--sender-asrc-max-ppm <PPM>      sender-side ASRC補正上限
 --duration-sec <SEC>             指定秒数で終了
 --metrics-interval-sec <SEC>     metrics表示間隔
 --drop-rate <RATE>               packet drop simulation
@@ -451,15 +460,20 @@ mise exec -- cargo run -p receiver -- \
   --listen 127.0.0.1:50000 \
   --output audio \
   --output-device "MacBook Proのスピーカー" \
-  --target-buffer-ms 80 \
-  --start-threshold-ms 80 \
-  --max-buffer-ms 160 \
-  --output-ring-ms 40 \
-  --output-ring-capacity-ms 200 \
-  --render-chunk-ms 5
+  --low-latency \
+  --low-latency-trim-margin-ms 10 \
+  --low-latency-trim-to-margin-ms 10 \
+  --realtime-renderer \
+  --output-buffer-size-frames 128 \
+  --target-buffer-ms 20 \
+  --start-threshold-ms 20 \
+  --max-buffer-ms 60 \
+  --output-ring-ms 15 \
+  --output-ring-capacity-ms 80 \
+  --render-chunk-ms 2
 ```
 
-さらに低い latency を狙う場合は `--output-ring-ms 20` も指定できますが、macOS の thread scheduling によって `ring_under` が出やすくなります。安定性優先では default の `40ms` 以上を推奨します。
+低遅延設定では `--low-latency` が `target + low-latency-trim-margin-ms` を超えた buffer を積極的に trim します。これにより `target=20ms` なのに `latency=60ms` で安定してしまう状態を避けます。安定性優先のBGM用途では、`target-buffer-ms=80` 以上、`output-ring-ms=40` 以上へ戻してください。
 
 主な receiver option:
 
@@ -482,6 +496,11 @@ mise exec -- cargo run -p receiver -- \
 --max-ppm <PPM>                         通常補正上限。default: 1000
 --emergency-max-ppm <PPM>               大きいズレ用の補正上限。default: 5000
 --no-adaptive-resampling                adaptive resamplingを無効化
+--low-latency                           target超過時のhard trimと低遅延renderer動作を有効化
+--low-latency-trim-margin-ms <MS>       hard trim開始余白。default: 10
+--low-latency-trim-to-margin-ms <MS>    hard trim後にtargetへ残す余白。default: 10
+--trim-crossfade-ms <MS>                trim時の短いfade。default: 1.5
+--realtime-renderer                     renderer threadのQoS/priorityを上げる
 --output-buffer-size-frames <FRAMES>    CoreAudio buffer size固定指定
 --output-ring-ms <MS>                   CoreAudio callback前のSPSC ring目標量。default: 40
 --output-ring-capacity-ms <MS>          SPSC ring容量。default: 200
@@ -504,7 +523,7 @@ sender: input=capture packets=200.0/s bitrate=1.619Mbps sequence=...
 
 見るところ:
 
-- `packets`: 5ms packet なら約 `200/s`
+- `packets`: 5ms packet なら約 `200/s`、2.5ms packet なら約 `400/s`
 - `bitrate`: 48kHz / stereo / 16-bit なら約 `1.6Mbps`
 - `rms`: capture 音量。無音なら `-120dB` 付近
 - `dropped`, `errors`: sender 側送信異常
@@ -512,6 +531,7 @@ sender: input=capture packets=200.0/s bitrate=1.619Mbps sequence=...
 - `remote_outq`: receiver の output ring 水位
 - `remote_qdrop`: receiver の UDP thread -> renderer queue drop
 - `remote_steady_under`, `remote_ring_under`: 通常運転中の underrun
+- `send_corr`: sender-side ASRC の補正量
 - `remote_ratio`: receiver の実効 resampling ratio
 
 receiver:
@@ -556,7 +576,7 @@ jitter buffer latency
 + capture device 側の遅延
 ```
 
-default では `target-buffer-ms=100` と `output-ring-ms=40` なので、安定性優先の設定です。localhost や有線LANで攻める場合は `target-buffer-ms=80`, `output-ring-ms=40` 程度から試すのが現実的です。
+通常の CLI default は `target-buffer-ms=100` と `output-ring-ms=40` なので、安定性優先の設定です。Makefile の `make receiver` / `make sender` は低遅延検証用に `target-buffer-ms=20`, `output-ring-ms=15`, `packet-ms=2.5`, `--low-latency`, `--sender-side-asrc` を使います。
 
 ## bit depth と clipping
 
@@ -573,13 +593,14 @@ sample rate: 48000 Hz
 channels: 2
 sample format: signed 16-bit little endian PCM
 default packet duration: 5 ms
-frames per packet: 240
-payload bytes per packet: 960
-nominal packet rate: 200 packets/s
+low-latency packet duration: 2.5 ms
+frames per packet: 240 at 5 ms, 120 at 2.5 ms
+payload bytes per packet: 960 at 5 ms, 480 at 2.5 ms
+nominal packet rate: 200 packets/s at 5 ms, 400 packets/s at 2.5 ms
 nominal bitrate: 1.536 Mbps + UDP/IP overhead
 ```
 
-5ms packet は UDP payload が通常の Ethernet MTU 1500 bytes 未満に収まるようにしています。
+5ms / 2.5ms packet はどちらも UDP payload が通常の Ethernet MTU 1500 bytes 未満に収まるようにしています。
 
 ## トラブルシュート
 
