@@ -248,21 +248,23 @@ impl JitterBuffer {
             return;
         }
 
+        let channels = self.config.channels as usize;
+        let output_sample_rate = output_sample_rate.max(1);
+        let device_resample_ratio = self.config.sample_rate as f32 / output_sample_rate as f32;
+
         self.maybe_start();
         if self.state != JitterState::Running {
             if self.stream_id.is_some() {
                 self.metrics.startup_underruns += 1;
             }
+            self.reset_correction_metrics(device_resample_ratio);
             self.refresh_metrics();
             return;
         }
         self.trim_excess_latency();
 
-        let channels = self.config.channels as usize;
-        let output_sample_rate = output_sample_rate.max(1);
         let output_frames = output.len() / channels;
         let output_duration_secs = output_frames as f32 / output_sample_rate as f32;
-        let device_resample_ratio = self.config.sample_rate as f32 / output_sample_rate as f32;
         let correction_ppm = self.compute_correction_ppm(output_duration_secs);
         let correction_ratio = 1.0 + correction_ppm / 1_000_000.0;
         let ratio = correction_ratio * device_resample_ratio;
@@ -321,6 +323,7 @@ impl JitterBuffer {
                 self.state = JitterState::Priming;
                 self.read_pos = self.latest_received_end as f64;
                 self.consecutive_missing_frames = 0;
+                self.reset_correction_metrics(device_resample_ratio);
             } else if self.consecutive_missing_frames > self.config.sample_rate as u64 / 2 {
                 self.clear_for_resync(ResyncReason::Underrun);
             }
@@ -440,6 +443,19 @@ impl JitterBuffer {
         self.metrics.filtered_error_ms = self.filtered_error_ms;
         self.metrics.integral_correction_ppm = integral_ppm;
         correction_ppm
+    }
+
+    fn reset_correction_metrics(&mut self, device_resample_ratio: f32) {
+        self.filtered_error_ms = 0.0;
+        self.error_filter_initialized = false;
+        self.integral_error_ms_sec = 0.0;
+        self.metrics.device_resample_ratio = device_resample_ratio;
+        self.metrics.correction_ppm = 0.0;
+        self.metrics.buffer_error_ms = self.buffer_level_ms() - self.config.target_ms as f32;
+        self.metrics.filtered_error_ms = 0.0;
+        self.metrics.integral_correction_ppm = 0.0;
+        self.metrics.effective_resample_ratio = device_resample_ratio;
+        self.metrics.resample_ratio = device_resample_ratio;
     }
 
     fn trim_excess_latency(&mut self) {
@@ -667,6 +683,8 @@ mod tests {
         assert_eq!(metrics.startup_underruns, 1);
         assert_eq!(metrics.steady_underruns, 0);
         assert_eq!(metrics.output_underruns, 0);
+        assert_eq!(metrics.correction_ppm, 0.0);
+        assert_eq!(metrics.effective_resample_ratio, 1.0);
     }
 
     #[test]
