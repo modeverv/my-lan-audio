@@ -238,7 +238,6 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
-    config.sample_rate = args.sample_rate;
 
     println!(
         "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?}",
@@ -266,6 +265,7 @@ fn build_jitter_output_stream(
     jitter: Arc<Mutex<JitterBuffer>>,
 ) -> Result<Stream> {
     let err_fn = |err| eprintln!("audio output stream error: {err}");
+    let output_sample_rate = config.sample_rate;
     let stream = match sample_format {
         SampleFormat::F32 => {
             let jitter = jitter.clone();
@@ -273,7 +273,7 @@ fn build_jitter_output_stream(
                 *config,
                 move |data: &mut [f32], _| {
                     if let Ok(mut jitter) = jitter.try_lock() {
-                        jitter.pull_f32(data);
+                        jitter.pull_f32_at_sample_rate(data, output_sample_rate);
                     } else {
                         data.fill(0.0);
                     }
@@ -288,7 +288,7 @@ fn build_jitter_output_stream(
                 *config,
                 move |data: &mut [i16], _| {
                     if let Ok(mut jitter) = jitter.try_lock() {
-                        jitter.pull_i16(data);
+                        jitter.pull_i16_at_sample_rate(data, output_sample_rate);
                     } else {
                         data.fill(0);
                     }
@@ -304,7 +304,7 @@ fn build_jitter_output_stream(
                 move |data: &mut [u16], _| {
                     if let Ok(mut jitter) = jitter.try_lock() {
                         let mut tmp = vec![0.0f32; data.len()];
-                        jitter.pull_f32(&mut tmp);
+                        jitter.pull_f32_at_sample_rate(&mut tmp, output_sample_rate);
                         for (dst, src) in data.iter_mut().zip(tmp) {
                             *dst = f32_to_u16(src);
                         }
@@ -347,7 +347,6 @@ fn run_test_tone(args: &Args) -> Result<()> {
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
-    config.sample_rate = args.sample_rate;
     let phase = Arc::new(Mutex::new(0.0f32));
 
     println!(

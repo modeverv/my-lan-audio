@@ -189,6 +189,10 @@ impl JitterBuffer {
     }
 
     pub fn pull_f32(&mut self, output: &mut [f32]) {
+        self.pull_f32_at_sample_rate(output, self.config.sample_rate);
+    }
+
+    pub fn pull_f32_at_sample_rate(&mut self, output: &mut [f32], output_sample_rate: u32) {
         output.fill(0.0);
         if output.is_empty() || self.config.channels == 0 {
             return;
@@ -201,7 +205,9 @@ impl JitterBuffer {
         }
 
         let channels = self.config.channels as usize;
-        let ratio = self.compute_resample_ratio();
+        let output_sample_rate = output_sample_rate.max(1);
+        let device_resample_ratio = self.config.sample_rate as f32 / output_sample_rate as f32;
+        let ratio = self.compute_resample_ratio() * device_resample_ratio;
         self.metrics.resample_ratio = ratio;
 
         let mut missing_in_call = 0u64;
@@ -253,8 +259,12 @@ impl JitterBuffer {
     }
 
     pub fn pull_i16(&mut self, output: &mut [i16]) {
+        self.pull_i16_at_sample_rate(output, self.config.sample_rate);
+    }
+
+    pub fn pull_i16_at_sample_rate(&mut self, output: &mut [i16], output_sample_rate: u32) {
         let mut tmp = vec![0.0f32; output.len()];
-        self.pull_f32(&mut tmp);
+        self.pull_f32_at_sample_rate(&mut tmp, output_sample_rate);
         for (dst, src) in output.iter_mut().zip(tmp) {
             *dst = f32_to_i16(src);
         }
@@ -494,5 +504,33 @@ mod tests {
 
         assert_eq!(buffer.metrics().state, JitterState::Running);
         assert!(buffer.metrics().buffer_level_ms <= 110.0);
+    }
+
+    #[test]
+    fn consumes_48k_stream_at_44k1_output_rate() {
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            start_threshold_ms: 50,
+            target_ms: 100,
+            adaptive_resampling: false,
+            ..JitterConfig::default()
+        });
+        for sequence in 0..200 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+        }
+
+        let mut out = vec![0.0; 441 * 2];
+        buffer.pull_f32_at_sample_rate(&mut out, 44_100);
+        assert_eq!(buffer.metrics().state, JitterState::Running);
+        assert!(buffer.metrics().buffer_level_ms <= 100.0);
+
+        buffer.insert_packet(packet(200, 200 * 240), Instant::now());
+        buffer.insert_packet(packet(201, 201 * 240), Instant::now());
+        let before = buffer.metrics().buffer_level_ms;
+        buffer.pull_f32_at_sample_rate(&mut out, 44_100);
+        let after = buffer.metrics().buffer_level_ms;
+
+        assert_eq!(buffer.metrics().state, JitterState::Running);
+        assert!((before - after - 10.0).abs() < 0.5);
+        assert!((buffer.metrics().resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
     }
 }
