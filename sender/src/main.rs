@@ -8,6 +8,7 @@ use lan_audio_common::audio::{
 };
 use lan_audio_common::packet::{AudioPacket, AudioPacketHeader};
 use lan_audio_common::resampler::{resample_linear, StreamingLinearResampler};
+use lan_audio_common::status::ReceiverStatus;
 use rand::Rng;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -15,6 +16,7 @@ use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +28,9 @@ struct Args {
 
     #[arg(long, default_value = "0.0.0.0:0")]
     bind: SocketAddr,
+
+    #[arg(long)]
+    feedback_listen: Option<SocketAddr>,
 
     #[arg(long, default_value = "sine", value_parser = ["dummy", "sine", "capture"])]
     input: String,
@@ -86,6 +91,8 @@ struct SendStats {
     dropped_packets: u64,
     send_errors: u64,
 }
+
+type SharedReceiverStatus = Arc<Mutex<Option<ReceiverStatus>>>;
 
 struct PacketSender {
     socket: UdpSocket,
@@ -194,15 +201,17 @@ struct MetricsPrinter {
     last: Instant,
     last_packets: u64,
     last_bytes: u64,
+    remote_status: Option<SharedReceiverStatus>,
 }
 
 impl MetricsPrinter {
-    fn new(interval_sec: f64) -> Self {
+    fn new(interval_sec: f64, remote_status: Option<SharedReceiverStatus>) -> Self {
         Self {
             interval: Duration::from_secs_f64(interval_sec.max(0.1)),
             last: Instant::now(),
             last_packets: 0,
             last_bytes: 0,
+            remote_status,
         }
     }
 
@@ -215,8 +224,9 @@ impl MetricsPrinter {
         let packets = sender.stats.sent_packets - self.last_packets;
         let bytes = sender.stats.sent_bytes - self.last_bytes;
         let bitrate_mbps = bytes as f64 * 8.0 / elapsed / 1_000_000.0;
+        let remote_suffix = self.remote_suffix();
         println!(
-            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={}",
+            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={}{}",
             packets as f64 / elapsed,
             bitrate_mbps,
             sender.sequence,
@@ -225,12 +235,35 @@ impl MetricsPrinter {
             rms.0,
             rms.1,
             sender.stats.dropped_packets,
-            sender.stats.send_errors
+            sender.stats.send_errors,
+            remote_suffix
         );
 
         self.last = Instant::now();
         self.last_packets = sender.stats.sent_packets;
         self.last_bytes = sender.stats.sent_bytes;
+    }
+
+    fn remote_suffix(&self) -> String {
+        let Some(remote_status) = &self.remote_status else {
+            return String::new();
+        };
+        let Ok(status) = remote_status.try_lock() else {
+            return " remote_status=busy".to_string();
+        };
+        let Some(status) = status.as_ref() else {
+            return " remote_status=waiting".to_string();
+        };
+        format!(
+            " remote_latency={:.1}ms remote_target={}ms remote_steady_under={} remote_lock_miss={} remote_trims={} remote_resyncs={} remote_ratio={:.6}",
+            status.audio_latency_ms,
+            status.target_ms,
+            status.steady_underruns,
+            status.callback_lock_misses,
+            status.latency_trims,
+            status.resyncs,
+            status.effective_ratio
+        )
     }
 }
 
@@ -246,14 +279,16 @@ fn main() -> Result<()> {
         return run_capture_monitor(&args);
     }
 
+    let remote_status = spawn_feedback_listener(args.feedback_listen)?;
+
     if let Some(path) = &args.input_file {
-        return run_file_sender(&args, path);
+        return run_file_sender(&args, path, remote_status);
     }
 
     match args.input.as_str() {
-        "dummy" => run_generated_sender(&args, GeneratedInput::Dummy),
-        "sine" => run_generated_sender(&args, GeneratedInput::Sine),
-        "capture" => run_capture_sender(&args),
+        "dummy" => run_generated_sender(&args, GeneratedInput::Dummy, remote_status),
+        "sine" => run_generated_sender(&args, GeneratedInput::Sine, remote_status),
+        "capture" => run_capture_sender(&args, remote_status),
         other => bail!("unsupported input mode {other}"),
     }
 }
@@ -275,6 +310,36 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn spawn_feedback_listener(listen: Option<SocketAddr>) -> Result<Option<SharedReceiverStatus>> {
+    let Some(listen) = listen else {
+        return Ok(None);
+    };
+    let socket = UdpSocket::bind(listen)
+        .with_context(|| format!("failed to bind feedback UDP socket to {listen}"))?;
+    println!("sender: feedback_listening={listen}");
+
+    let status = Arc::new(Mutex::new(None));
+    let shared_status = Arc::clone(&status);
+    thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((len, _addr)) => match ReceiverStatus::from_bytes(&buf[..len]) {
+                    Ok(remote) => {
+                        if let Ok(mut status) = shared_status.lock() {
+                            *status = Some(remote);
+                        }
+                    }
+                    Err(err) => eprintln!("sender: invalid feedback status: {err}"),
+                },
+                Err(err) => eprintln!("sender: feedback receive error: {err}"),
+            }
+        }
+    });
+
+    Ok(Some(status))
+}
+
 fn packet_frames(args: &Args) -> Result<usize> {
     let frames = args.sample_rate as u64 * args.packet_ms as u64 / 1000;
     if frames == 0 {
@@ -288,10 +353,14 @@ enum GeneratedInput {
     Sine,
 }
 
-fn run_generated_sender(args: &Args, input: GeneratedInput) -> Result<()> {
+fn run_generated_sender(
+    args: &Args,
+    input: GeneratedInput,
+    remote_status: Option<SharedReceiverStatus>,
+) -> Result<()> {
     let packet_frames = packet_frames(args)?;
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status);
     let start = Instant::now();
     let mut next_tick = Instant::now();
     let interval = packet_interval(args);
@@ -331,7 +400,11 @@ fn run_generated_sender(args: &Args, input: GeneratedInput) -> Result<()> {
     }
 }
 
-fn run_file_sender(args: &Args, path: &Path) -> Result<()> {
+fn run_file_sender(
+    args: &Args,
+    path: &Path,
+    remote_status: Option<SharedReceiverStatus>,
+) -> Result<()> {
     let packet_frames = packet_frames(args)?;
     let frames = load_wav_as_stereo(path, args.sample_rate)
         .with_context(|| format!("failed to read WAV input {}", path.display()))?;
@@ -340,7 +413,7 @@ fn run_file_sender(args: &Args, path: &Path) -> Result<()> {
     }
 
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status);
     let start = Instant::now();
     let mut next_tick = Instant::now();
     let interval = packet_interval(args);
@@ -385,7 +458,7 @@ fn run_file_sender(args: &Args, path: &Path) -> Result<()> {
     }
 }
 
-fn run_capture_sender(args: &Args) -> Result<()> {
+fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) -> Result<()> {
     let packet_frames = packet_frames(args)?;
     let (stream, rx, source_rate) = open_capture_stream(args)?;
     stream.play().context("failed to start input stream")?;
@@ -396,7 +469,7 @@ fn run_capture_sender(args: &Args) -> Result<()> {
     );
     let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec);
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status);
     let mut pending = Vec::new();
     let start = Instant::now();
     let mut latest_rms = (-120.0, -120.0);

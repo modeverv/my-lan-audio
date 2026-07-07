@@ -68,6 +68,7 @@ pub struct JitterMetrics {
     pub resyncs: u64,
     pub resyncs_by_stream_change: u64,
     pub resyncs_by_underrun: u64,
+    pub stream_id: Option<u64>,
     pub latest_sequence: Option<u32>,
     pub latest_sample_position: Option<u64>,
     pub buffer_level_ms: f32,
@@ -103,6 +104,7 @@ impl Default for JitterMetrics {
             resyncs: 0,
             resyncs_by_stream_change: 0,
             resyncs_by_underrun: 0,
+            stream_id: None,
             latest_sequence: None,
             latest_sample_position: None,
             buffer_level_ms: 0.0,
@@ -343,6 +345,7 @@ impl JitterBuffer {
     pub fn metrics(&self) -> JitterMetrics {
         let mut metrics = self.metrics.clone();
         metrics.state = self.state;
+        metrics.stream_id = self.stream_id;
         let audio_latency_ms = self.buffer_level_ms();
         metrics.buffer_level_ms = audio_latency_ms;
         metrics.audio_latency_ms = audio_latency_ms;
@@ -519,6 +522,7 @@ impl JitterBuffer {
 
     fn refresh_metrics(&mut self) {
         self.metrics.state = self.state;
+        self.metrics.stream_id = self.stream_id;
         let audio_latency_ms = self.buffer_level_ms();
         self.metrics.buffer_level_ms = audio_latency_ms;
         self.metrics.audio_latency_ms = audio_latency_ms;

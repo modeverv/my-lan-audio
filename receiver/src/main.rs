@@ -6,6 +6,7 @@ use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use lan_audio_common::audio::{f32_to_i16, CHANNELS, SAMPLE_RATE};
 use lan_audio_common::jitter::{JitterBuffer, JitterConfig, JitterMetrics};
 use lan_audio_common::packet::AudioPacket;
+use lan_audio_common::status::ReceiverStatus;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::fs::File;
 use std::io::BufWriter;
@@ -14,13 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP receiver")]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:50000")]
     listen: SocketAddr,
+
+    #[arg(long)]
+    feedback_target: Option<SocketAddr>,
 
     #[arg(long, default_value = "null", value_parser = ["null", "audio", "wav"])]
     output: String,
@@ -234,7 +238,9 @@ fn run_timed_pull_output(
     } else {
         None
     };
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, None);
+    let feedback = FeedbackSender::new(args.feedback_target)?;
+    let mut metrics =
+        MetricsPrinter::new(args.metrics_interval_sec, None, feedback, args.sample_rate);
     let mut next_tick = Instant::now();
     let start = Instant::now();
 
@@ -292,7 +298,13 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
     )?;
     stream.play().context("failed to start output stream")?;
 
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, Some(callback_metrics));
+    let feedback = FeedbackSender::new(args.feedback_target)?;
+    let mut metrics = MetricsPrinter::new(
+        args.metrics_interval_sec,
+        Some(callback_metrics),
+        feedback,
+        config.sample_rate,
+    );
     let start = Instant::now();
     loop {
         if duration_elapsed(start, args.duration_sec) {
@@ -609,22 +621,60 @@ impl OutputCallbackMetrics {
     }
 }
 
+struct FeedbackSender {
+    socket: UdpSocket,
+    target: SocketAddr,
+}
+
+impl FeedbackSender {
+    fn new(target: Option<SocketAddr>) -> Result<Option<Self>> {
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let bind_addr = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind_addr)
+            .with_context(|| format!("failed to bind feedback UDP socket to {bind_addr}"))?;
+        println!("receiver: feedback_target={target}");
+        Ok(Some(Self { socket, target }))
+    }
+
+    fn send(&self, status: &ReceiverStatus) {
+        let bytes = status.to_bytes();
+        if let Err(err) = self.socket.send_to(&bytes, self.target) {
+            eprintln!("receiver: failed to send feedback status: {err}");
+        }
+    }
+}
+
 struct MetricsPrinter {
     interval: Duration,
     last: Instant,
     last_metrics: Option<JitterMetrics>,
     callback_metrics: Option<Arc<OutputCallbackMetrics>>,
     last_callback_metrics: OutputCallbackSnapshot,
+    feedback: Option<FeedbackSender>,
+    output_sample_rate: u32,
 }
 
 impl MetricsPrinter {
-    fn new(interval_sec: f64, callback_metrics: Option<Arc<OutputCallbackMetrics>>) -> Self {
+    fn new(
+        interval_sec: f64,
+        callback_metrics: Option<Arc<OutputCallbackMetrics>>,
+        feedback: Option<FeedbackSender>,
+        output_sample_rate: u32,
+    ) -> Self {
         Self {
             interval: Duration::from_secs_f64(interval_sec.max(0.1)),
             last: Instant::now(),
             last_metrics: None,
             callback_metrics,
             last_callback_metrics: OutputCallbackSnapshot::default(),
+            feedback,
+            output_sample_rate,
         }
     }
 
@@ -692,10 +742,37 @@ impl MetricsPrinter {
             metrics.resyncs_by_underrun
         );
 
+        if let Some(feedback) = &self.feedback {
+            feedback.send(&ReceiverStatus {
+                stream_id: metrics.stream_id.unwrap_or_default(),
+                latest_sequence: metrics.latest_sequence.unwrap_or_default(),
+                target_ms,
+                output_sample_rate: self.output_sample_rate,
+                received_packets: metrics.received_packets,
+                steady_underruns: metrics.steady_underruns,
+                startup_underruns: metrics.startup_underruns,
+                callback_lock_misses: callback_metrics.lock_misses,
+                latency_trims: metrics.latency_trims,
+                resyncs: metrics.resyncs,
+                scratch_overflows: callback_metrics.scratch_overflows,
+                audio_latency_ms: metrics.audio_latency_ms,
+                correction_ppm: metrics.correction_ppm,
+                effective_ratio: metrics.effective_resample_ratio,
+                receiver_time_ns: unix_time_ns(),
+            });
+        }
+
         self.last = Instant::now();
         self.last_metrics = Some(metrics);
         self.last_callback_metrics = callback_metrics;
     }
+}
+
+fn unix_time_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 fn select_output_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::Device> {
