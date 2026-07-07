@@ -59,7 +59,7 @@ Windows で VB-CABLE capture を試す場合:
 - Windows 側で Rust build できる環境
 - `CABLE Output` が入力デバイスとして見える状態
 
-このプロジェクトは LAN 内の実験用途です。暗号化、認証、Dante/AES67/RTP/PTP 互換はまだありません。
+このプロジェクトは LAN 内の実験用途です。暗号化、認証、Dante/AES67/RTP/PTP 互換機能はスコープ外です。
 
 ## 初回セットアップ
 
@@ -318,7 +318,7 @@ macOS 側:
 mise exec -- cargo run -p receiver -- \
   --listen 0.0.0.0:50000 \
   --output audio \
-  --output-device "BlackHole" \
+  --output-device "BlackHole 2ch" \
   --target-buffer-ms 100
 ```
 
