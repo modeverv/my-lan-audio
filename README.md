@@ -251,6 +251,40 @@ mise exec -- cargo run -p sender -- \
 - システム出力を BlackHole にすると、通常のスピーカーからは直接音が出なくなります。このアプリの receiver がスピーカーへ戻す役割になります。
 - feedback port は audio port と別です。上の例では audio が `50000`, feedback が `50001` です。
 
+### 30ms 目標の Makefile shortcut
+
+localhost で攻めた設定を試す場合は、receiver を先に起動してから sender を起動します。
+
+Terminal 1:
+
+```bash
+make receiver
+```
+
+Terminal 2:
+
+```bash
+make sender
+```
+
+既定値は以下です。
+
+```text
+receiver output device: MacBook
+sender input device: BlackHole
+audio: 127.0.0.1:50000
+feedback: 127.0.0.1:50001
+target-buffer-ms: 30
+output-ring-ms: 20
+```
+
+デバイス名や buffer は make 変数で上書きできます。
+
+```bash
+make receiver RECEIVER_OUTPUT_DEVICE="SOUNDPEATS Space" TARGET_BUFFER_MS=40 OUTPUT_RING_MS=30
+make sender SENDER_INPUT_DEVICE="BlackHole"
+```
+
 ## Windows -> macOS
 
 macOS 側 receiver:
