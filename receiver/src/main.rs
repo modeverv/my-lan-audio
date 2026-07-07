@@ -317,15 +317,17 @@ fn build_jitter_output_stream(
         SampleFormat::F32 => {
             let jitter = jitter.clone();
             let callback_metrics = Arc::clone(&callback_metrics);
+            let mut last_frame = vec![0.0f32; channels];
             device.build_output_stream(
                 *config,
                 move |data: &mut [f32], _| {
                     callback_metrics.record_callback(data.len() / channels);
                     if let Ok(mut jitter) = jitter.try_lock() {
                         jitter.pull_f32_at_sample_rate(data, output_sample_rate);
+                        update_last_frame(data, channels, &mut last_frame);
                     } else {
                         callback_metrics.record_lock_miss();
-                        data.fill(0.0);
+                        fill_with_last_frame_f32(data, channels, &last_frame);
                     }
                 },
                 err_fn,
@@ -336,6 +338,7 @@ fn build_jitter_output_stream(
             let jitter = jitter.clone();
             let callback_metrics = Arc::clone(&callback_metrics);
             let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
+            let mut last_frame = vec![0.0f32; channels];
             device.build_output_stream(
                 *config,
                 move |data: &mut [i16], _| {
@@ -343,17 +346,18 @@ fn build_jitter_output_stream(
                     if let Ok(mut jitter) = jitter.try_lock() {
                         if data.len() > scratch.len() {
                             callback_metrics.record_scratch_overflow();
-                            data.fill(0);
+                            fill_with_last_frame_i16(data, channels, &last_frame);
                             return;
                         }
                         let scratch = &mut scratch[..data.len()];
                         jitter.pull_f32_at_sample_rate(scratch, output_sample_rate);
+                        update_last_frame(scratch, channels, &mut last_frame);
                         for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
                             *dst = f32_to_i16(src);
                         }
                     } else {
                         callback_metrics.record_lock_miss();
-                        data.fill(0);
+                        fill_with_last_frame_i16(data, channels, &last_frame);
                     }
                 },
                 err_fn,
@@ -364,6 +368,7 @@ fn build_jitter_output_stream(
             let jitter = jitter.clone();
             let callback_metrics = Arc::clone(&callback_metrics);
             let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
+            let mut last_frame = vec![0.0f32; channels];
             device.build_output_stream(
                 *config,
                 move |data: &mut [u16], _| {
@@ -371,17 +376,18 @@ fn build_jitter_output_stream(
                     if let Ok(mut jitter) = jitter.try_lock() {
                         if data.len() > scratch.len() {
                             callback_metrics.record_scratch_overflow();
-                            data.fill(u16::MAX / 2);
+                            fill_with_last_frame_u16(data, channels, &last_frame);
                             return;
                         }
                         let scratch = &mut scratch[..data.len()];
                         jitter.pull_f32_at_sample_rate(scratch, output_sample_rate);
+                        update_last_frame(scratch, channels, &mut last_frame);
                         for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
                             *dst = f32_to_u16(src);
                         }
                     } else {
                         callback_metrics.record_lock_miss();
-                        data.fill(u16::MAX / 2);
+                        fill_with_last_frame_u16(data, channels, &last_frame);
                     }
                 },
                 err_fn,
@@ -391,6 +397,38 @@ fn build_jitter_output_stream(
         other => bail!("unsupported output sample format {other:?}"),
     };
     Ok(stream)
+}
+
+fn update_last_frame(samples: &[f32], channels: usize, last_frame: &mut [f32]) {
+    if samples.len() < channels || last_frame.len() < channels {
+        return;
+    }
+    let start = samples.len() - channels;
+    last_frame[..channels].copy_from_slice(&samples[start..start + channels]);
+}
+
+fn fill_with_last_frame_f32(data: &mut [f32], channels: usize, last_frame: &[f32]) {
+    for frame in data.chunks_exact_mut(channels) {
+        for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
+            *dst = src;
+        }
+    }
+}
+
+fn fill_with_last_frame_i16(data: &mut [i16], channels: usize, last_frame: &[f32]) {
+    for frame in data.chunks_exact_mut(channels) {
+        for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
+            *dst = f32_to_i16(src);
+        }
+    }
+}
+
+fn fill_with_last_frame_u16(data: &mut [u16], channels: usize, last_frame: &[f32]) {
+    for frame in data.chunks_exact_mut(channels) {
+        for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
+            *dst = f32_to_u16(src);
+        }
+    }
 }
 
 fn scratch_len_for_stream(config: &StreamConfig) -> usize {
