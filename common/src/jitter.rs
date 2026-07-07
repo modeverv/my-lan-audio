@@ -9,6 +9,7 @@ pub struct JitterConfig {
     pub channels: u16,
     pub capacity_ms: u32,
     pub target_ms: u32,
+    pub max_buffer_ms: u32,
     pub start_threshold_ms: u32,
     pub adaptive_resampling: bool,
     pub kp: f32,
@@ -23,6 +24,7 @@ impl Default for JitterConfig {
             channels: CHANNELS,
             capacity_ms: 1000,
             target_ms: 100,
+            max_buffer_ms: 300,
             start_threshold_ms: 100,
             adaptive_resampling: true,
             kp: 5.0,
@@ -52,6 +54,8 @@ pub struct JitterMetrics {
     pub invalid_packets: u64,
     pub output_underruns: u64,
     pub missing_frames: u64,
+    pub latency_trims: u64,
+    pub trimmed_frames: u64,
     pub resyncs: u64,
     pub latest_sequence: Option<u32>,
     pub latest_sample_position: Option<u64>,
@@ -73,6 +77,8 @@ impl Default for JitterMetrics {
             invalid_packets: 0,
             output_underruns: 0,
             missing_frames: 0,
+            latency_trims: 0,
+            trimmed_frames: 0,
             resyncs: 0,
             latest_sequence: None,
             latest_sample_position: None,
@@ -203,6 +209,7 @@ impl JitterBuffer {
             self.refresh_metrics();
             return;
         }
+        self.trim_excess_latency();
 
         let channels = self.config.channels as usize;
         let output_sample_rate = output_sample_rate.max(1);
@@ -341,6 +348,29 @@ impl JitterBuffer {
         };
         let correction_ppm = (error_ms * self.config.kp).clamp(-max_ppm, max_ppm);
         1.0 + correction_ppm / 1_000_000.0
+    }
+
+    fn trim_excess_latency(&mut self) {
+        if self.config.max_buffer_ms <= self.config.target_ms {
+            return;
+        }
+
+        let max_frames = self.frames_from_ms(self.config.max_buffer_ms);
+        let target_frames = self.frames_from_ms(self.config.target_ms);
+        let level = self.buffer_level_frames();
+        if level <= max_frames || self.latest_received_end <= target_frames {
+            return;
+        }
+
+        let new_read_pos = self.latest_received_end - target_frames;
+        let old_read_pos = self.read_pos.floor().max(0.0) as u64;
+        if new_read_pos > old_read_pos {
+            let skipped = new_read_pos - old_read_pos;
+            self.read_pos = new_read_pos as f64;
+            self.metrics.latency_trims += 1;
+            self.metrics.trimmed_frames += skipped;
+            self.prune_played_packets();
+        }
     }
 
     fn sample_at(&self, position: u64) -> Option<StereoFrame> {
@@ -493,6 +523,7 @@ mod tests {
         let mut buffer = JitterBuffer::new(JitterConfig {
             start_threshold_ms: 50,
             target_ms: 100,
+            max_buffer_ms: 300,
             ..JitterConfig::default()
         });
         for sequence in 0..200 {
@@ -511,6 +542,7 @@ mod tests {
         let mut buffer = JitterBuffer::new(JitterConfig {
             start_threshold_ms: 50,
             target_ms: 100,
+            max_buffer_ms: 300,
             adaptive_resampling: false,
             ..JitterConfig::default()
         });
@@ -532,5 +564,34 @@ mod tests {
         assert_eq!(buffer.metrics().state, JitterState::Running);
         assert!((before - after - 10.0).abs() < 0.5);
         assert!((buffer.metrics().resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn trims_back_to_target_when_latency_grows_too_large() {
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            start_threshold_ms: 50,
+            target_ms: 100,
+            max_buffer_ms: 150,
+            adaptive_resampling: false,
+            ..JitterConfig::default()
+        });
+        for sequence in 0..200 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+        }
+
+        let mut out = vec![0.0; 240 * 2];
+        buffer.pull_f32(&mut out);
+        assert_eq!(buffer.metrics().state, JitterState::Running);
+
+        for sequence in 200..260 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+        }
+        assert!(buffer.metrics().buffer_level_ms > 150.0);
+
+        buffer.pull_f32(&mut out);
+        let metrics = buffer.metrics();
+        assert_eq!(metrics.latency_trims, 1);
+        assert!(metrics.trimmed_frames > 0);
+        assert!(metrics.buffer_level_ms <= 110.0);
     }
 }

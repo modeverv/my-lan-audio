@@ -48,6 +48,9 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     target_buffer_ms: u32,
 
+    #[arg(long, default_value_t = 300)]
+    max_buffer_ms: u32,
+
     #[arg(long, default_value_t = 100)]
     start_threshold_ms: u32,
 
@@ -101,6 +104,9 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.target_buffer_ms == 0 || args.start_threshold_ms == 0 {
         bail!("buffer timing values must be greater than zero");
     }
+    if args.max_buffer_ms <= args.target_buffer_ms {
+        bail!("--max-buffer-ms must be greater than --target-buffer-ms");
+    }
     Ok(())
 }
 
@@ -119,6 +125,7 @@ fn run_receiver(args: &Args) -> Result<()> {
         channels: args.channels,
         capacity_ms: args.capacity_ms,
         target_ms: args.target_buffer_ms,
+        max_buffer_ms: args.max_buffer_ms,
         start_threshold_ms: args.start_threshold_ms,
         adaptive_resampling: !args.no_adaptive_resampling,
         kp: args.kp,
@@ -476,8 +483,10 @@ impl MetricsPrinter {
 
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let previous = self.last_metrics.clone().unwrap_or_default();
+        let trimmed_frames = metrics.trimmed_frames - previous.trimmed_frames;
+        let trimmed_ms_per_sec = trimmed_frames as f64 * 1000.0 / SAMPLE_RATE as f64 / elapsed;
         println!(
-            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s buffer={:.1}ms target={}ms ratio={:.6} drift={:.1}ppm underruns={} resyncs={}",
+            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s buffer={:.1}ms target={}ms ratio={:.6} drift={:.1}ppm underruns={} trims={} trim={:.1}ms/s resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             (metrics.lost_packets - previous.lost_packets) as f64 / elapsed,
@@ -489,6 +498,8 @@ impl MetricsPrinter {
             metrics.resample_ratio,
             metrics.estimated_drift_ppm,
             metrics.output_underruns,
+            metrics.latency_trims,
+            trimmed_ms_per_sec,
             metrics.resyncs
         );
 
