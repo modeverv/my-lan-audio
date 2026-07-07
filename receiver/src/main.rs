@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
+use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use lan_audio_common::audio::{f32_to_i16, CHANNELS, SAMPLE_RATE};
 use lan_audio_common::jitter::{JitterBuffer, JitterConfig, JitterMetrics};
@@ -305,12 +305,22 @@ fn build_jitter_output_stream(
         SampleFormat::I16 => {
             let jitter = jitter.clone();
             let callback_metrics = Arc::clone(&callback_metrics);
+            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
             device.build_output_stream(
                 *config,
                 move |data: &mut [i16], _| {
                     callback_metrics.record_callback(data.len() / channels);
                     if let Ok(mut jitter) = jitter.try_lock() {
-                        jitter.pull_i16_at_sample_rate(data, output_sample_rate);
+                        if data.len() > scratch.len() {
+                            callback_metrics.record_scratch_overflow();
+                            data.fill(0);
+                            return;
+                        }
+                        let scratch = &mut scratch[..data.len()];
+                        jitter.pull_f32_at_sample_rate(scratch, output_sample_rate);
+                        for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
+                            *dst = f32_to_i16(src);
+                        }
                     } else {
                         callback_metrics.record_lock_miss();
                         data.fill(0);
@@ -323,14 +333,20 @@ fn build_jitter_output_stream(
         SampleFormat::U16 => {
             let jitter = jitter.clone();
             let callback_metrics = Arc::clone(&callback_metrics);
+            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
             device.build_output_stream(
                 *config,
                 move |data: &mut [u16], _| {
                     callback_metrics.record_callback(data.len() / channels);
                     if let Ok(mut jitter) = jitter.try_lock() {
-                        let mut tmp = vec![0.0f32; data.len()];
-                        jitter.pull_f32_at_sample_rate(&mut tmp, output_sample_rate);
-                        for (dst, src) in data.iter_mut().zip(tmp) {
+                        if data.len() > scratch.len() {
+                            callback_metrics.record_scratch_overflow();
+                            data.fill(u16::MAX / 2);
+                            return;
+                        }
+                        let scratch = &mut scratch[..data.len()];
+                        jitter.pull_f32_at_sample_rate(scratch, output_sample_rate);
+                        for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
                             *dst = f32_to_u16(src);
                         }
                     } else {
@@ -345,6 +361,17 @@ fn build_jitter_output_stream(
         other => bail!("unsupported output sample format {other:?}"),
     };
     Ok(stream)
+}
+
+fn scratch_len_for_stream(config: &StreamConfig) -> usize {
+    let channels = usize::from(config.channels.max(1));
+    let frames = match config.buffer_size {
+        BufferSize::Fixed(frames) => usize::try_from(frames).unwrap_or(usize::MAX / channels),
+        BufferSize::Default => {
+            (usize::try_from(config.sample_rate).unwrap_or(48_000) / 2).max(2048)
+        }
+    };
+    frames.saturating_mul(channels)
 }
 
 fn run_test_tone(args: &Args) -> Result<()> {
@@ -479,6 +506,7 @@ struct OutputCallbackMetrics {
     callbacks: AtomicU64,
     frames: AtomicU64,
     lock_misses: AtomicU64,
+    scratch_overflows: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -486,6 +514,7 @@ struct OutputCallbackSnapshot {
     callbacks: u64,
     frames: u64,
     lock_misses: u64,
+    scratch_overflows: u64,
 }
 
 impl OutputCallbackMetrics {
@@ -498,11 +527,16 @@ impl OutputCallbackMetrics {
         self.lock_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_scratch_overflow(&self) {
+        self.scratch_overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> OutputCallbackSnapshot {
         OutputCallbackSnapshot {
             callbacks: self.callbacks.load(Ordering::Relaxed),
             frames: self.frames.load(Ordering::Relaxed),
             lock_misses: self.lock_misses.load(Ordering::Relaxed),
+            scratch_overflows: self.scratch_overflows.load(Ordering::Relaxed),
         }
     }
 }
@@ -555,8 +589,11 @@ impl MetricsPrinter {
         let lock_miss_delta = callback_metrics
             .lock_misses
             .saturating_sub(self.last_callback_metrics.lock_misses);
+        let scratch_overflow_delta = callback_metrics
+            .scratch_overflows
+            .saturating_sub(self.last_callback_metrics.scratch_overflows);
         println!(
-            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms device_ratio={:.6} corr={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms device_ratio={:.6} corr={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             (metrics.lost_packets - previous.lost_packets) as f64 / elapsed,
@@ -576,6 +613,7 @@ impl MetricsPrinter {
             callback_delta as f64 / elapsed,
             callback_frames_delta as f64 / elapsed,
             lock_miss_delta as f64 / elapsed,
+            scratch_overflow_delta as f64 / elapsed,
             metrics.latency_trims,
             trimmed_ms_per_sec,
             metrics.resyncs,
