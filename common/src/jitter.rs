@@ -310,9 +310,9 @@ impl JitterBuffer {
         ) && self.buffer_level_frames() >= self.frames_from_ms(self.config.start_threshold_ms)
         {
             if let Some(first) = self.packets.keys().next().copied() {
-                if self.read_pos < first as f64 || self.read_pos > self.latest_received_end as f64 {
-                    self.read_pos = first as f64;
-                }
+                let target_frames = self.frames_from_ms(self.config.target_ms);
+                let target_read_pos = self.latest_received_end.saturating_sub(target_frames);
+                self.read_pos = target_read_pos.max(first) as f64;
             }
             self.state = JitterState::Running;
         }
@@ -476,5 +476,23 @@ mod tests {
             InsertOutcome::Duplicate
         );
         assert_eq!(buffer.metrics().duplicate_packets, 1);
+    }
+
+    #[test]
+    fn starts_near_target_latency_when_over_primed() {
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            start_threshold_ms: 50,
+            target_ms: 100,
+            ..JitterConfig::default()
+        });
+        for sequence in 0..200 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+        }
+
+        let mut out = vec![0.0; 240 * 2];
+        buffer.pull_f32(&mut out);
+
+        assert_eq!(buffer.metrics().state, JitterState::Running);
+        assert!(buffer.metrics().buffer_level_ms <= 110.0);
     }
 }
