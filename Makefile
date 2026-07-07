@@ -1,4 +1,4 @@
-.PHONY: help receive receiver sender receiver-devices sender-devices build test check
+.PHONY: help receive receiver sender p-receiver p-sender release receiver-devices sender-devices build test check
 
 AUDIO_ADDR ?= 127.0.0.1:50000
 FEEDBACK_ADDR ?= 127.0.0.1:50001
@@ -27,6 +27,9 @@ help:
 	@printf '%s\n' '  make receiver          Start receiver with low-latency localhost settings'
 	@printf '%s\n' '  make receive           Alias for make receiver'
 	@printf '%s\n' '  make sender            Start capture sender with feedback enabled'
+	@printf '%s\n' '  make p-receiver        Start release receiver with feedback enabled'
+	@printf '%s\n' '  make p-sender          Start release sender with feedback enabled'
+	@printf '%s\n' '  make release           Build release binaries'
 	@printf '%s\n' '  make receiver-devices  List receiver output devices'
 	@printf '%s\n' '  make sender-devices    List sender input devices'
 	@printf '%s\n' '  make build             Build workspace'
@@ -72,8 +75,10 @@ sender:
 
 
 p-receiver:
+	mise exec -- cargo build --release -p receiver
 	target/release/receiver \
 	  --listen $(AUDIO_ADDR) \
+	  --feedback-target $(FEEDBACK_ADDR) \
 	  --low-latency \
 	  --low-latency-trim-margin-ms 10 \
 	  --low-latency-trim-to-margin-ms 10 \
@@ -92,8 +97,10 @@ p-receiver:
 
 
 p-sender:
+	mise exec -- cargo build --release -p sender
 	target/release/sender \
 	  --target $(AUDIO_ADDR) \
+	  --feedback-listen $(FEEDBACK_ADDR) \
 	  --input capture \
 	  --device "$(SENDER_INPUT_DEVICE)" \
 	  --packet-ms $(PACKET_MS) \
@@ -109,6 +116,9 @@ sender-devices:
 
 build:
 	mise exec -- cargo build
+
+release:
+	mise exec -- cargo build --release
 
 test:
 	mise exec -- cargo test
