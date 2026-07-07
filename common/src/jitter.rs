@@ -250,34 +250,45 @@ impl JitterBuffer {
         self.metrics.resample_ratio = ratio;
 
         let mut missing_in_call = 0u64;
-        for frame_out in output.chunks_exact_mut(channels) {
-            let pos0 = self.read_pos.floor() as u64;
-            let frac = (self.read_pos - pos0 as f64) as f32;
+        let mut read_pos = self.read_pos;
+        let mut consecutive_missing_frames = self.consecutive_missing_frames;
+        {
+            let packets = &self.packets;
+            let mut packet_cache = None;
+            for frame_out in output.chunks_exact_mut(channels) {
+                let pos0 = read_pos.floor() as u64;
+                let frac = (read_pos - pos0 as f64) as f32;
 
-            match (self.sample_at(pos0), self.sample_at(pos0 + 1)) {
-                (Some(a), Some(b)) => {
-                    let frame = a.lerp(b, frac);
-                    frame_out[0] = frame.left;
-                    if channels > 1 {
-                        frame_out[1] = frame.right;
+                match (
+                    sample_at_cached(packets, channels, pos0, &mut packet_cache),
+                    sample_at_cached(packets, channels, pos0 + 1, &mut packet_cache),
+                ) {
+                    (Some(a), Some(b)) => {
+                        let frame = a.lerp(b, frac);
+                        frame_out[0] = frame.left;
+                        if channels > 1 {
+                            frame_out[1] = frame.right;
+                        }
+                        consecutive_missing_frames = 0;
                     }
-                    self.consecutive_missing_frames = 0;
-                }
-                (Some(a), None) => {
-                    frame_out[0] = a.left;
-                    if channels > 1 {
-                        frame_out[1] = a.right;
+                    (Some(a), None) => {
+                        frame_out[0] = a.left;
+                        if channels > 1 {
+                            frame_out[1] = a.right;
+                        }
+                        consecutive_missing_frames = 0;
                     }
-                    self.consecutive_missing_frames = 0;
+                    _ => {
+                        missing_in_call += 1;
+                        consecutive_missing_frames += 1;
+                    }
                 }
-                _ => {
-                    missing_in_call += 1;
-                    self.consecutive_missing_frames += 1;
-                }
+
+                read_pos += ratio as f64;
             }
-
-            self.read_pos += ratio as f64;
         }
+        self.read_pos = read_pos;
+        self.consecutive_missing_frames = consecutive_missing_frames;
 
         if missing_in_call > 0 {
             self.metrics.missing_frame_calls += 1;
@@ -406,26 +417,6 @@ impl JitterBuffer {
         }
     }
 
-    fn sample_at(&self, position: u64) -> Option<StereoFrame> {
-        let (start, packet) = self.packets.range(..=position).next_back()?;
-        let offset = position.checked_sub(*start)? as usize;
-        if offset >= packet.frame_count {
-            return None;
-        }
-        let sample_offset = offset * self.config.channels as usize;
-        let left = *packet.payload.get(sample_offset)?;
-        let right = if self.config.channels == 1 {
-            left
-        } else {
-            *packet.payload.get(sample_offset + 1).unwrap_or(&left)
-        };
-
-        Some(StereoFrame {
-            left: i16_to_f32(left),
-            right: i16_to_f32(right),
-        })
-    }
-
     fn prune_played_packets(&mut self) {
         let read_pos = self.read_pos.floor() as u64;
         let old_keys: Vec<u64> = self
@@ -497,6 +488,52 @@ impl JitterBuffer {
     fn frames_from_ms(&self, ms: u32) -> u64 {
         self.config.sample_rate as u64 * ms as u64 / 1000
     }
+}
+
+fn sample_at_cached<'a>(
+    packets: &'a BTreeMap<u64, PacketFrames>,
+    channels: usize,
+    position: u64,
+    cache: &mut Option<(u64, &'a PacketFrames)>,
+) -> Option<StereoFrame> {
+    if let Some((start, packet)) = cache {
+        if position >= *start && position < *start + packet.frame_count as u64 {
+            return sample_from_packet(*start, packet, channels, position);
+        }
+    }
+
+    let (start, packet) = packets.range(..=position).next_back()?;
+    if position >= *start + packet.frame_count as u64 {
+        return None;
+    }
+
+    *cache = Some((*start, packet));
+    sample_from_packet(*start, packet, channels, position)
+}
+
+fn sample_from_packet(
+    start: u64,
+    packet: &PacketFrames,
+    channels: usize,
+    position: u64,
+) -> Option<StereoFrame> {
+    let offset = position.checked_sub(start)? as usize;
+    if offset >= packet.frame_count {
+        return None;
+    }
+
+    let sample_offset = offset * channels;
+    let left = *packet.payload.get(sample_offset)?;
+    let right = if channels == 1 {
+        left
+    } else {
+        *packet.payload.get(sample_offset + 1).unwrap_or(&left)
+    };
+
+    Some(StereoFrame {
+        left: i16_to_f32(left),
+        right: i16_to_f32(right),
+    })
 }
 
 #[cfg(test)]
