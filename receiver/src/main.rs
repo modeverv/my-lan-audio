@@ -231,18 +231,18 @@ fn run_timed_pull_output(
 fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()> {
     let host = cpal::default_host();
     let device = select_output_device(&host, args.output_device.as_deref())?;
-    let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let name = device.to_string();
     let supported = device
         .default_output_config()
         .context("failed to get default output config")?;
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
-    config.sample_rate = cpal::SampleRate(args.sample_rate);
+    config.sample_rate = args.sample_rate;
 
     println!(
         "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?}",
-        name, config.sample_rate.0, config.channels, sample_format
+        name, config.sample_rate, config.channels, sample_format
     );
 
     let stream = build_jitter_output_stream(&device, sample_format, &config, jitter.clone())?;
@@ -270,7 +270,7 @@ fn build_jitter_output_stream(
         SampleFormat::F32 => {
             let jitter = jitter.clone();
             device.build_output_stream(
-                config,
+                *config,
                 move |data: &mut [f32], _| {
                     if let Ok(mut jitter) = jitter.try_lock() {
                         jitter.pull_f32(data);
@@ -285,7 +285,7 @@ fn build_jitter_output_stream(
         SampleFormat::I16 => {
             let jitter = jitter.clone();
             device.build_output_stream(
-                config,
+                *config,
                 move |data: &mut [i16], _| {
                     if let Ok(mut jitter) = jitter.try_lock() {
                         jitter.pull_i16(data);
@@ -300,7 +300,7 @@ fn build_jitter_output_stream(
         SampleFormat::U16 => {
             let jitter = jitter.clone();
             device.build_output_stream(
-                config,
+                *config,
                 move |data: &mut [u16], _| {
                     if let Ok(mut jitter) = jitter.try_lock() {
                         let mut tmp = vec![0.0f32; data.len()];
@@ -340,19 +340,19 @@ fn run_test_tone(args: &Args) -> Result<()> {
 
     let host = cpal::default_host();
     let device = select_output_device(&host, args.output_device.as_deref())?;
-    let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let name = device.to_string();
     let supported = device
         .default_output_config()
         .context("failed to get default output config")?;
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
-    config.sample_rate = cpal::SampleRate(args.sample_rate);
+    config.sample_rate = args.sample_rate;
     let phase = Arc::new(Mutex::new(0.0f32));
 
     println!(
         "receiver: test_tone output_device=\"{}\" output_format={}Hz/{}ch/{:?}",
-        name, config.sample_rate.0, config.channels, sample_format
+        name, config.sample_rate, config.channels, sample_format
     );
     let stream = build_tone_output_stream(&device, sample_format, &config, phase, args.freq)?;
     stream.play().context("failed to start output stream")?;
@@ -373,14 +373,14 @@ fn build_tone_output_stream(
     phase: Arc<Mutex<f32>>,
     freq: f32,
 ) -> Result<Stream> {
-    let sample_rate = config.sample_rate.0;
+    let sample_rate = config.sample_rate;
     let channels = config.channels as usize;
     let err_fn = |err| eprintln!("audio output stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
             let phase = phase.clone();
             device.build_output_stream(
-                config,
+                *config,
                 move |data: &mut [f32], _| fill_tone_f32(data, channels, sample_rate, freq, &phase),
                 err_fn,
                 None,
@@ -389,7 +389,7 @@ fn build_tone_output_stream(
         SampleFormat::I16 => {
             let phase = phase.clone();
             device.build_output_stream(
-                config,
+                *config,
                 move |data: &mut [i16], _| {
                     let mut tmp = vec![0.0f32; data.len()];
                     fill_tone_f32(&mut tmp, channels, sample_rate, freq, &phase);
@@ -404,7 +404,7 @@ fn build_tone_output_stream(
         SampleFormat::U16 => {
             let phase = phase.clone();
             device.build_output_stream(
-                config,
+                *config,
                 move |data: &mut [u16], _| {
                     let mut tmp = vec![0.0f32; data.len()];
                     fill_tone_f32(&mut tmp, channels, sample_rate, freq, &phase);
@@ -502,7 +502,7 @@ fn select_output_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal:
     if let Some(filter) = filter {
         let filter = filter.to_lowercase();
         for device in host.output_devices()? {
-            let name = device.name().unwrap_or_default();
+            let name = device.to_string();
             if name.to_lowercase().contains(&filter) {
                 return Ok(device);
             }
@@ -517,13 +517,13 @@ fn select_output_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal:
 fn list_output_devices() -> Result<()> {
     let host = cpal::default_host();
     for (index, device) in host.output_devices()?.enumerate() {
-        let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+        let name = device.to_string();
         let default = device
             .default_output_config()
             .map(|config| {
                 format!(
                     "{}Hz/{}ch/{:?}",
-                    config.sample_rate().0,
+                    config.sample_rate(),
                     config.channels(),
                     config.sample_format()
                 )

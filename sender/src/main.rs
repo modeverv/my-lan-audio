@@ -487,13 +487,13 @@ fn run_capture_monitor(args: &Args) -> Result<()> {
 fn open_capture_stream(args: &Args) -> Result<(Stream, Receiver<Vec<StereoFrame>>, u32)> {
     let host = cpal::default_host();
     let device = select_input_device(&host, args.device.as_deref())?;
-    let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let device_name = device.to_string();
     let supported = device
         .default_input_config()
         .context("failed to get default input config")?;
     let sample_format = supported.sample_format();
     let config = supported.config();
-    let source_rate = config.sample_rate.0;
+    let source_rate = config.sample_rate;
     let source_channels = config.channels as usize;
     let (tx, rx) = sync_channel::<Vec<StereoFrame>>(32);
 
@@ -518,7 +518,7 @@ fn build_input_stream(
         SampleFormat::F32 => {
             let tx = tx.clone();
             device.build_input_stream(
-                config,
+                *config,
                 move |data: &[f32], _| {
                     let _ = tx.try_send(input_f32_to_stereo(data, channels));
                 },
@@ -529,7 +529,7 @@ fn build_input_stream(
         SampleFormat::I16 => {
             let tx = tx.clone();
             device.build_input_stream(
-                config,
+                *config,
                 move |data: &[i16], _| {
                     let _ = tx.try_send(input_i16_to_stereo(data, channels));
                 },
@@ -540,7 +540,7 @@ fn build_input_stream(
         SampleFormat::U16 => {
             let tx = tx.clone();
             device.build_input_stream(
-                config,
+                *config,
                 move |data: &[u16], _| {
                     let _ = tx.try_send(input_u16_to_stereo(data, channels));
                 },
@@ -591,7 +591,7 @@ fn select_input_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::
     if let Some(filter) = filter {
         let filter = filter.to_lowercase();
         for device in host.input_devices()? {
-            let name = device.name().unwrap_or_default();
+            let name = device.to_string();
             if name.to_lowercase().contains(&filter) {
                 return Ok(device);
             }
@@ -606,13 +606,13 @@ fn select_input_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::
 fn list_input_devices() -> Result<()> {
     let host = cpal::default_host();
     for (index, device) in host.input_devices()?.enumerate() {
-        let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+        let name = device.to_string();
         let default = device
             .default_input_config()
             .map(|config| {
                 format!(
                     "{}Hz/{}ch/{:?}",
-                    config.sample_rate().0,
+                    config.sample_rate(),
                     config.channels(),
                     config.sample_format()
                 )
