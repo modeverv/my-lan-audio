@@ -464,10 +464,13 @@ P1 partial:
   - callback内のBTreeMap lookupをpacket cacheで軽量化
   - lock miss / scratch overflow時に即ゼロではなくlast frameを保持
   - output buffer sizeを --output-buffer-size-frames で固定指定可能にした
+  - audio callbackをSPSC ring読み取り専用にし、Mutex<JitterBuffer> / BTreeMapから切り離した
+  - renderer threadがJitterBufferから短いchunkを生成してoutput ringへpushする構造にした
+  - output ringの outq / ring_under / ring_missing / renderer_lock_miss をmetrics化した
 
 P2:
   - receiver --feedback-target で ReceiverStatus UDP を送信
-  - sender --feedback-listen で remote_latency / remote_steady_under / remote_lock_miss / remote_ratio を表示
+  - sender --feedback-listen で remote_latency / remote_outq / remote_ring_under / remote_steady_under / remote_lock_miss / remote_ratio を表示
 
 P3 partial:
   - receiver-only ASRCをP制御から低速PI制御へ拡張
@@ -485,12 +488,12 @@ P3 partial:
 - receiver -> sender feedbackで sender側に remote_latency=70.0ms remote_ratio=0.999995 が表示されることを確認
 ```
 
-まだ残る大きな構造課題:
+残る構造課題:
 
 ```text
-- audio callback はまだ Mutex<JitterBuffer> を try_lock している
-- UDP thread と audio callback が同じ JitterBuffer を共有している
-- callback 経路から BTreeMap を完全には排除できていない
+- audio callbackから Mutex<JitterBuffer> / BTreeMap は外れた
+- ただし renderer thread と UDP receive thread はまだ同じ JitterBuffer を Mutex 経由で共有している
+- renderer_lock_miss が増える場合は、UDP receive -> renderer の間も channel / ownership分離する必要がある
 ```
 
-次の本命は、UDP受信・reorder・jitter管理をcallback外へ移し、audio callback は事前確保されたSPSC ringから読むだけにすること。
+次の本命は、UDP受信threadがpacketをchannelへ送り、renderer threadがJitterBufferを単独所有する形にして、renderer側のMutexも消すこと。

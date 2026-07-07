@@ -1,4 +1,7 @@
+mod audio_ring;
+
 use anyhow::{anyhow, bail, Context, Result};
+use audio_ring::SpscF32Ring;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
@@ -83,6 +86,15 @@ struct Args {
     #[arg(long)]
     output_buffer_size_frames: Option<u32>,
 
+    #[arg(long, default_value_t = 20)]
+    output_ring_ms: u32,
+
+    #[arg(long, default_value_t = 200)]
+    output_ring_capacity_ms: u32,
+
+    #[arg(long, default_value_t = 5)]
+    render_chunk_ms: u32,
+
     #[arg(long, default_value_t = 1_048_576)]
     socket_recv_buffer_bytes: usize,
 
@@ -135,6 +147,12 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     }
     if args.output_buffer_size_frames == Some(0) {
         bail!("--output-buffer-size-frames must be greater than zero");
+    }
+    if args.output_ring_ms == 0 || args.output_ring_capacity_ms == 0 || args.render_chunk_ms == 0 {
+        bail!("output ring and render chunk timing values must be greater than zero");
+    }
+    if args.output_ring_capacity_ms < args.output_ring_ms + args.render_chunk_ms {
+        bail!("--output-ring-capacity-ms must be at least --output-ring-ms + --render-chunk-ms");
     }
     Ok(())
 }
@@ -239,8 +257,13 @@ fn run_timed_pull_output(
         None
     };
     let feedback = FeedbackSender::new(args.feedback_target)?;
-    let mut metrics =
-        MetricsPrinter::new(args.metrics_interval_sec, None, feedback, args.sample_rate);
+    let mut metrics = MetricsPrinter::new(
+        args.metrics_interval_sec,
+        None,
+        feedback,
+        args.sample_rate,
+        args.channels,
+    );
     let mut next_tick = Instant::now();
     let start = Instant::now();
 
@@ -288,12 +311,25 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
         name, config.sample_rate, config.channels, sample_format, config.buffer_size
     );
 
+    let channels = usize::from(config.channels.max(1));
+    let ring_capacity_samples =
+        samples_from_ms(config.sample_rate, channels, args.output_ring_capacity_ms);
+    let ring = Arc::new(SpscF32Ring::new(ring_capacity_samples));
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
-    let stream = build_jitter_output_stream(
+    spawn_ring_renderer(
+        Arc::clone(&jitter),
+        Arc::clone(&ring),
+        Arc::clone(&callback_metrics),
+        config.sample_rate,
+        channels,
+        args.output_ring_ms,
+        args.render_chunk_ms,
+    );
+    let stream = build_ring_output_stream(
         &device,
         sample_format,
         &config,
-        jitter.clone(),
+        Arc::clone(&ring),
         Arc::clone(&callback_metrics),
     )?;
     stream.play().context("failed to start output stream")?;
@@ -304,6 +340,7 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
         Some(callback_metrics),
         feedback,
         config.sample_rate,
+        config.channels,
     );
     let start = Instant::now();
     loop {
@@ -315,31 +352,32 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
     }
 }
 
-fn build_jitter_output_stream(
+fn build_ring_output_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
     config: &StreamConfig,
-    jitter: Arc<Mutex<JitterBuffer>>,
+    ring: Arc<SpscF32Ring>,
     callback_metrics: Arc<OutputCallbackMetrics>,
 ) -> Result<Stream> {
     let err_fn = |err| eprintln!("audio output stream error: {err}");
-    let output_sample_rate = config.sample_rate;
     let channels = usize::from(config.channels.max(1));
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let jitter = jitter.clone();
+            let ring = Arc::clone(&ring);
             let callback_metrics = Arc::clone(&callback_metrics);
             let mut last_frame = vec![0.0f32; channels];
             device.build_output_stream(
                 *config,
                 move |data: &mut [f32], _| {
                     callback_metrics.record_callback(data.len() / channels);
-                    if let Ok(mut jitter) = jitter.try_lock() {
-                        jitter.pull_f32_at_sample_rate(data, output_sample_rate);
-                        update_last_frame(data, channels, &mut last_frame);
-                    } else {
-                        callback_metrics.record_lock_miss();
-                        fill_with_last_frame_f32(data, channels, &last_frame);
+                    let popped = ring.pop_interleaved(data, channels);
+                    callback_metrics.record_output_queue_samples(ring.len_samples());
+                    if popped > 0 {
+                        update_last_frame(&data[..popped], channels, &mut last_frame);
+                    }
+                    if popped < data.len() {
+                        callback_metrics.record_ring_underrun((data.len() - popped) / channels);
+                        fill_with_last_frame_f32(&mut data[popped..], channels, &last_frame);
                     }
                 },
                 err_fn,
@@ -347,7 +385,7 @@ fn build_jitter_output_stream(
             )?
         }
         SampleFormat::I16 => {
-            let jitter = jitter.clone();
+            let ring = Arc::clone(&ring);
             let callback_metrics = Arc::clone(&callback_metrics);
             let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
             let mut last_frame = vec![0.0f32; channels];
@@ -355,21 +393,23 @@ fn build_jitter_output_stream(
                 *config,
                 move |data: &mut [i16], _| {
                     callback_metrics.record_callback(data.len() / channels);
-                    if let Ok(mut jitter) = jitter.try_lock() {
-                        if data.len() > scratch.len() {
-                            callback_metrics.record_scratch_overflow();
-                            fill_with_last_frame_i16(data, channels, &last_frame);
-                            return;
-                        }
-                        let scratch = &mut scratch[..data.len()];
-                        jitter.pull_f32_at_sample_rate(scratch, output_sample_rate);
-                        update_last_frame(scratch, channels, &mut last_frame);
-                        for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                            *dst = f32_to_i16(src);
-                        }
-                    } else {
-                        callback_metrics.record_lock_miss();
+                    if data.len() > scratch.len() {
+                        callback_metrics.record_scratch_overflow();
                         fill_with_last_frame_i16(data, channels, &last_frame);
+                        return;
+                    }
+                    let scratch = &mut scratch[..data.len()];
+                    let popped = ring.pop_interleaved(scratch, channels);
+                    callback_metrics.record_output_queue_samples(ring.len_samples());
+                    if popped > 0 {
+                        update_last_frame(&scratch[..popped], channels, &mut last_frame);
+                    }
+                    if popped < scratch.len() {
+                        callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
+                        fill_with_last_frame_f32(&mut scratch[popped..], channels, &last_frame);
+                    }
+                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
+                        *dst = f32_to_i16(src);
                     }
                 },
                 err_fn,
@@ -377,7 +417,7 @@ fn build_jitter_output_stream(
             )?
         }
         SampleFormat::U16 => {
-            let jitter = jitter.clone();
+            let ring = Arc::clone(&ring);
             let callback_metrics = Arc::clone(&callback_metrics);
             let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
             let mut last_frame = vec![0.0f32; channels];
@@ -385,21 +425,23 @@ fn build_jitter_output_stream(
                 *config,
                 move |data: &mut [u16], _| {
                     callback_metrics.record_callback(data.len() / channels);
-                    if let Ok(mut jitter) = jitter.try_lock() {
-                        if data.len() > scratch.len() {
-                            callback_metrics.record_scratch_overflow();
-                            fill_with_last_frame_u16(data, channels, &last_frame);
-                            return;
-                        }
-                        let scratch = &mut scratch[..data.len()];
-                        jitter.pull_f32_at_sample_rate(scratch, output_sample_rate);
-                        update_last_frame(scratch, channels, &mut last_frame);
-                        for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                            *dst = f32_to_u16(src);
-                        }
-                    } else {
-                        callback_metrics.record_lock_miss();
+                    if data.len() > scratch.len() {
+                        callback_metrics.record_scratch_overflow();
                         fill_with_last_frame_u16(data, channels, &last_frame);
+                        return;
+                    }
+                    let scratch = &mut scratch[..data.len()];
+                    let popped = ring.pop_interleaved(scratch, channels);
+                    callback_metrics.record_output_queue_samples(ring.len_samples());
+                    if popped > 0 {
+                        update_last_frame(&scratch[..popped], channels, &mut last_frame);
+                    }
+                    if popped < scratch.len() {
+                        callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
+                        fill_with_last_frame_f32(&mut scratch[popped..], channels, &last_frame);
+                    }
+                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
+                        *dst = f32_to_u16(src);
                     }
                 },
                 err_fn,
@@ -409,6 +451,59 @@ fn build_jitter_output_stream(
         other => bail!("unsupported output sample format {other:?}"),
     };
     Ok(stream)
+}
+
+fn spawn_ring_renderer(
+    jitter: Arc<Mutex<JitterBuffer>>,
+    ring: Arc<SpscF32Ring>,
+    metrics: Arc<OutputCallbackMetrics>,
+    output_sample_rate: u32,
+    channels: usize,
+    output_ring_ms: u32,
+    render_chunk_ms: u32,
+) {
+    thread::spawn(move || {
+        let channels = channels.max(1);
+        let target_samples = samples_from_ms(output_sample_rate, channels, output_ring_ms);
+        let chunk_frames = (output_sample_rate as usize * render_chunk_ms as usize / 1000).max(1);
+        let mut render_scratch = vec![0.0f32; chunk_frames * channels];
+        let sleep_duration =
+            Duration::from_micros(((render_chunk_ms as u64 * 1000) / 2).max(1_000));
+
+        loop {
+            loop {
+                let queued = ring.len_samples();
+                metrics.record_output_queue_samples(queued);
+                if queued >= target_samples {
+                    break;
+                }
+
+                let missing_samples = target_samples - queued;
+                let frames_to_render = (missing_samples / channels).min(chunk_frames);
+                if frames_to_render == 0 {
+                    break;
+                }
+                let sample_count = frames_to_render * channels;
+                let scratch = &mut render_scratch[..sample_count];
+
+                match jitter.try_lock() {
+                    Ok(mut jitter) => jitter.pull_f32_at_sample_rate(scratch, output_sample_rate),
+                    Err(_) => {
+                        metrics.record_renderer_lock_miss();
+                        break;
+                    }
+                }
+
+                let pushed = ring.push_interleaved(scratch, channels);
+                if pushed < sample_count {
+                    metrics.record_ring_overflow((sample_count - pushed) / channels);
+                    break;
+                }
+            }
+
+            thread::sleep(sleep_duration);
+        }
+    });
 }
 
 fn update_last_frame(samples: &[f32], channels: usize, last_frame: &mut [f32]) {
@@ -441,6 +536,11 @@ fn fill_with_last_frame_u16(data: &mut [u16], channels: usize, last_frame: &[f32
             *dst = f32_to_u16(src);
         }
     }
+}
+
+fn samples_from_ms(sample_rate: u32, channels: usize, ms: u32) -> usize {
+    let channels = channels.max(1);
+    ((sample_rate as usize * ms as usize / 1000).max(1)).saturating_mul(channels)
 }
 
 fn scratch_len_for_stream(config: &StreamConfig) -> usize {
@@ -587,6 +687,11 @@ struct OutputCallbackMetrics {
     frames: AtomicU64,
     lock_misses: AtomicU64,
     scratch_overflows: AtomicU64,
+    ring_underruns: AtomicU64,
+    ring_missing_frames: AtomicU64,
+    ring_overflows: AtomicU64,
+    renderer_lock_misses: AtomicU64,
+    output_queue_samples: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -595,6 +700,11 @@ struct OutputCallbackSnapshot {
     frames: u64,
     lock_misses: u64,
     scratch_overflows: u64,
+    ring_underruns: u64,
+    ring_missing_frames: u64,
+    ring_overflows: u64,
+    renderer_lock_misses: u64,
+    output_queue_samples: u64,
 }
 
 impl OutputCallbackMetrics {
@@ -603,12 +713,28 @@ impl OutputCallbackMetrics {
         self.frames.fetch_add(frames as u64, Ordering::Relaxed);
     }
 
-    fn record_lock_miss(&self) {
-        self.lock_misses.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn record_scratch_overflow(&self) {
         self.scratch_overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_ring_underrun(&self, missing_frames: usize) {
+        self.ring_underruns.fetch_add(1, Ordering::Relaxed);
+        self.ring_missing_frames
+            .fetch_add(missing_frames as u64, Ordering::Relaxed);
+    }
+
+    fn record_ring_overflow(&self, dropped_frames: usize) {
+        self.ring_overflows
+            .fetch_add(dropped_frames as u64, Ordering::Relaxed);
+    }
+
+    fn record_renderer_lock_miss(&self) {
+        self.renderer_lock_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_output_queue_samples(&self, samples: usize) {
+        self.output_queue_samples
+            .store(samples as u64, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> OutputCallbackSnapshot {
@@ -617,6 +743,11 @@ impl OutputCallbackMetrics {
             frames: self.frames.load(Ordering::Relaxed),
             lock_misses: self.lock_misses.load(Ordering::Relaxed),
             scratch_overflows: self.scratch_overflows.load(Ordering::Relaxed),
+            ring_underruns: self.ring_underruns.load(Ordering::Relaxed),
+            ring_missing_frames: self.ring_missing_frames.load(Ordering::Relaxed),
+            ring_overflows: self.ring_overflows.load(Ordering::Relaxed),
+            renderer_lock_misses: self.renderer_lock_misses.load(Ordering::Relaxed),
+            output_queue_samples: self.output_queue_samples.load(Ordering::Relaxed),
         }
     }
 }
@@ -658,6 +789,7 @@ struct MetricsPrinter {
     last_callback_metrics: OutputCallbackSnapshot,
     feedback: Option<FeedbackSender>,
     output_sample_rate: u32,
+    output_channels: u16,
 }
 
 impl MetricsPrinter {
@@ -666,6 +798,7 @@ impl MetricsPrinter {
         callback_metrics: Option<Arc<OutputCallbackMetrics>>,
         feedback: Option<FeedbackSender>,
         output_sample_rate: u32,
+        output_channels: u16,
     ) -> Self {
         Self {
             interval: Duration::from_secs_f64(interval_sec.max(0.1)),
@@ -675,6 +808,7 @@ impl MetricsPrinter {
             last_callback_metrics: OutputCallbackSnapshot::default(),
             feedback,
             output_sample_rate,
+            output_channels,
         }
     }
 
@@ -710,8 +844,23 @@ impl MetricsPrinter {
         let scratch_overflow_delta = callback_metrics
             .scratch_overflows
             .saturating_sub(self.last_callback_metrics.scratch_overflows);
+        let ring_underrun_delta = callback_metrics
+            .ring_underruns
+            .saturating_sub(self.last_callback_metrics.ring_underruns);
+        let ring_missing_delta = callback_metrics
+            .ring_missing_frames
+            .saturating_sub(self.last_callback_metrics.ring_missing_frames);
+        let ring_overflow_delta = callback_metrics
+            .ring_overflows
+            .saturating_sub(self.last_callback_metrics.ring_overflows);
+        let renderer_lock_miss_delta = callback_metrics
+            .renderer_lock_misses
+            .saturating_sub(self.last_callback_metrics.renderer_lock_misses);
+        let output_queue_ms = callback_metrics.output_queue_samples as f64 * 1000.0
+            / self.output_sample_rate.max(1) as f64
+            / self.output_channels.max(1) as f64;
         println!(
-            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms err={:.1}ms filt={:.1}ms device_ratio={:.6} corr={:.1}ppm int={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms outq={:.1}ms err={:.1}ms filt={:.1}ms device_ratio={:.6} corr={:.1}ppm int={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s renderer_lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             (metrics.lost_packets - previous.lost_packets) as f64 / elapsed,
@@ -720,6 +869,7 @@ impl MetricsPrinter {
             (metrics.out_of_order_packets - previous.out_of_order_packets) as f64 / elapsed,
             metrics.audio_latency_ms,
             target_ms,
+            output_queue_ms,
             metrics.buffer_error_ms,
             metrics.filtered_error_ms,
             metrics.device_resample_ratio,
@@ -734,6 +884,10 @@ impl MetricsPrinter {
             callback_delta as f64 / elapsed,
             callback_frames_delta as f64 / elapsed,
             lock_miss_delta as f64 / elapsed,
+            renderer_lock_miss_delta as f64 / elapsed,
+            ring_underrun_delta as f64 / elapsed,
+            ring_missing_delta as f64 / elapsed,
+            ring_overflow_delta as f64 / elapsed,
             scratch_overflow_delta as f64 / elapsed,
             metrics.latency_trims,
             trimmed_ms_per_sec,
@@ -755,7 +909,10 @@ impl MetricsPrinter {
                 latency_trims: metrics.latency_trims,
                 resyncs: metrics.resyncs,
                 scratch_overflows: callback_metrics.scratch_overflows,
+                ring_underruns: callback_metrics.ring_underruns,
+                ring_missing_frames: callback_metrics.ring_missing_frames,
                 audio_latency_ms: metrics.audio_latency_ms,
+                output_queue_ms: output_queue_ms as f32,
                 correction_ppm: metrics.correction_ppm,
                 effective_ratio: metrics.effective_resample_ratio,
                 receiver_time_ns: unix_time_ns(),
