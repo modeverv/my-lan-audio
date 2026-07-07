@@ -67,6 +67,9 @@ struct Args {
     #[arg(long)]
     no_adaptive_resampling: bool,
 
+    #[arg(long)]
+    output_buffer_size_frames: Option<u32>,
+
     #[arg(long, default_value_t = 1_048_576)]
     socket_recv_buffer_bytes: usize,
 
@@ -107,6 +110,9 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     }
     if args.max_buffer_ms <= args.target_buffer_ms {
         bail!("--max-buffer-ms must be greater than --target-buffer-ms");
+    }
+    if args.output_buffer_size_frames == Some(0) {
+        bail!("--output-buffer-size-frames must be greater than zero");
     }
     Ok(())
 }
@@ -246,10 +252,13 @@ fn run_audio_output(args: &Args, jitter: Arc<Mutex<JitterBuffer>>) -> Result<()>
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
+    if let Some(frames) = args.output_buffer_size_frames {
+        config.buffer_size = BufferSize::Fixed(frames);
+    }
 
     println!(
-        "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?}",
-        name, config.sample_rate, config.channels, sample_format
+        "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?} buffer={:?}",
+        name, config.sample_rate, config.channels, sample_format, config.buffer_size
     );
 
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
