@@ -305,6 +305,22 @@ make receiver FIXED_DELAY_FRAMES= FIXED_LATENCY_MS=300
 make sender SENDER_INPUT_DEVICE="BlackHole" PACKET_MS=5
 ```
 
+direct path + packet clock sync で 1 frame まで詰める場合は、release build の低遅延 shortcut を使います。
+
+Terminal 1:
+
+```bash
+make d-receiver
+```
+
+Terminal 2:
+
+```bash
+make d-sender
+```
+
+`d-receiver` の既定値は `DIRECT_FIXED_DELAY_FRAMES`, `DIRECT_OUTPUT_SAMPLE_RATE`, `DIRECT_OUTPUT_BUFFER_SIZE_FRAMES`, `DIRECT_CLOCK_SYNC` で調整できます。`d-sender` は `DIRECT_PACKET_MS`, `DIRECT_CAPTURE_QUEUE_CAPACITY`, `DIRECT_CAPTURE_QUEUE_MODE`, `DIRECT_CAPTURE_PACKET_PACING` で送信packet幅、capture queue容量、読み取り方式、packet pacingを調整します。既定の `DIRECT_CAPTURE_QUEUE_MODE=fifo` はcapture済みchunkを古い順に送り、`latest` は低遅延維持のために古いchunkを捨てます。`DIRECT_CAPTURE_PACKET_PACING=on` はcapture chunkを一気送信せず、`DIRECT_PACKET_MS` の間隔で1packetずつ送ります。どちらも起動時に `logs/d-receiver-YYYYmmdd-HHMMSS.log` / `logs/d-sender-YYYYmmdd-HHMMSS.log` へ build と実行ログを残します。`logs/` は git 管理外です。
+
 ## Windows で動かす
 
 PowerShell の実行ポリシーで `.ps1` を直接実行できない場合は、以下のように `-ExecutionPolicy Bypass` 付きで起動してください。以降の例はプロジェクトルートから実行します。
@@ -482,6 +498,9 @@ mise exec -- cargo run -p sender -- \
 --sample-rate <HZ>               packet sample rate。現在は48000のみ
 --channels <N>                   channel数。現在は2のみ
 --packet-ms <MS>                 packet duration。default: 5
+--capture-queue-capacity <N>     live capture chunk queue容量。default: 32
+--capture-queue-mode latest|fifo live capture queue読み取り方式。default: latest
+--capture-packet-pacing off|on   live capture packet送信をpacket-ms間隔へ整形。default: off
 --sender-side-asrc               receiver feedbackでsender送出レートを微調整
 --sender-asrc-kp <K>             sender-side ASRCの比例係数
 --sender-asrc-max-ppm <PPM>      sender-side ASRC補正上限
