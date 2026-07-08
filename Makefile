@@ -1,143 +1,105 @@
-.PHONY: help receive receiver sender fixed-receiver fixed-sender p-receiver p-receiver-tmp p-sender p-fixed-receiver p-fixed-sender w-sender release receiver-list sender-list receiver-devices sender-devices build test check
+.PHONY: help receive receiver sender p-receiver p-sender release build test check receiver-devices sender-devices mac-ip
 
-AUDIO_ADDR ?= 0.0.0.0:50000
-FEEDBACK_ADDR ?= 192.168.11.28:50001
+AUDIO_PORT ?= 50000
+FEEDBACK_PORT ?= 50001
 
-# TODO change to windows pc ip
-W_AUDIO_ADDR ?= 192.168.11.65:50000
-W_FEEDBACK_ADDR ?= 0.0.0.0:50001
-
-#RECEIVER_OUTPUT_DEVICE ?= MacBook Proのスピーカー
-#RECEIVER_OUTPUT_DEVICE ?= BlackHole 2ch
+RECEIVER_LISTEN ?= 0.0.0.0:$(AUDIO_PORT)
+RECEIVER_OUTPUT ?= audio
 RECEIVER_OUTPUT_DEVICE ?= SOUNDPEATS Space
+RECEIVER_FEEDBACK_TARGET ?= 192.168.11.28:$(FEEDBACK_PORT)
 
+SENDER_TARGET ?= 127.0.0.1:$(AUDIO_PORT)
+SENDER_INPUT ?= capture
 SENDER_INPUT_DEVICE ?= BlackHole 2ch
+SENDER_FEEDBACK_LISTEN ?= 0.0.0.0:$(FEEDBACK_PORT)
 
 FIXED_DELAY_FRAMES ?= 14400
 FIXED_LATENCY_MS ?=
-
-OUTPUT_RING_MS ?= 60
-OUTPUT_RING_CAPACITY_MS ?= 160
-RENDER_CHUNK_MS ?= 2
-OUTPUT_BUFFER_SIZE_FRAMES ?= 256
 PACKET_MS ?= 5
-METRICS_INTERVAL_SEC ?= 1
 
-FIXED_DELAY_ARGS :=
+FIXED_DELAY_ARG :=
 ifneq ($(strip $(FIXED_DELAY_FRAMES)),)
-FIXED_DELAY_ARGS := --fixed-delay-frames $(FIXED_DELAY_FRAMES)
+FIXED_DELAY_ARG := --fixed-delay-frames $(FIXED_DELAY_FRAMES)
 endif
-ifeq ($(strip $(FIXED_DELAY_ARGS)),)
+ifeq ($(strip $(FIXED_DELAY_ARG)),)
 ifneq ($(strip $(FIXED_LATENCY_MS)),)
-FIXED_DELAY_ARGS := --fixed-latency-ms $(FIXED_LATENCY_MS)
+FIXED_DELAY_ARG := --fixed-latency-ms $(FIXED_LATENCY_MS)
 endif
 endif
+
+RECEIVER_DEVICE_ARG :=
+ifneq ($(strip $(RECEIVER_OUTPUT_DEVICE)),)
+RECEIVER_DEVICE_ARG := --output-device "$(RECEIVER_OUTPUT_DEVICE)"
+endif
+
+RECEIVER_FEEDBACK_ARG :=
+ifneq ($(strip $(RECEIVER_FEEDBACK_TARGET)),)
+RECEIVER_FEEDBACK_ARG := --feedback-target $(RECEIVER_FEEDBACK_TARGET)
+endif
+
+SENDER_DEVICE_ARG :=
+ifneq ($(strip $(SENDER_INPUT_DEVICE)),)
+SENDER_DEVICE_ARG := --device "$(SENDER_INPUT_DEVICE)"
+endif
+
+SENDER_FEEDBACK_ARGS :=
+ifneq ($(strip $(SENDER_FEEDBACK_LISTEN)),)
+SENDER_FEEDBACK_ARGS := --feedback-listen $(SENDER_FEEDBACK_LISTEN) --sender-side-asrc
+endif
+
+RECEIVER_ARGS = --listen $(RECEIVER_LISTEN) $(RECEIVER_FEEDBACK_ARG) --output $(RECEIVER_OUTPUT) $(RECEIVER_DEVICE_ARG) $(FIXED_DELAY_ARG)
+SENDER_ARGS = --target $(SENDER_TARGET) $(SENDER_FEEDBACK_ARGS) --input $(SENDER_INPUT) $(SENDER_DEVICE_ARG) --packet-ms $(PACKET_MS)
 
 help:
 	@printf '%s\n' 'Targets:'
-	@printf '%s\n' '  make receiver          Start fixed-buffer receiver'
-	@printf '%s\n' '  make receive           Alias for make receiver'
-	@printf '%s\n' '  make sender            Start capture sender with feedback enabled'
-	@printf '%s\n' '  make fixed-receiver    Start receiver with explicit fixed-buffer settings'
-	@printf '%s\n' '  make fixed-sender      Start sender with fixed-buffer packet settings'
-	@printf '%s\n' '  make p-receiver        Start release receiver with feedback enabled'
-	@printf '%s\n' '  make p-sender          Start release sender with feedback enabled'
-	@printf '%s\n' '  make p-fixed-receiver  Start release receiver with explicit fixed-buffer settings'
-	@printf '%s\n' '  make p-fixed-sender    Start release sender with fixed-buffer packet settings'
-	@printf '%s\n' '  make release           Build release binaries'
-	@printf '%s\n' '  make receiver-devices  List receiver output devices'
-	@printf '%s\n' '  make sender-devices    List sender input devices'
-	@printf '%s\n' '  make build             Build workspace'
-	@printf '%s\n' '  make test              Run cargo test'
-	@printf '%s\n' '  make check             Run fmt, clippy, and tests'
+	@printf '%s\n' '  make receiver           Run debug receiver'
+	@printf '%s\n' '  make p-receiver         Build and run release receiver'
+	@printf '%s\n' '  make sender             Run debug sender'
+	@printf '%s\n' '  make p-sender           Build and run release sender'
+	@printf '%s\n' '  make mac-ip             Print local LAN addresses for Windows sender target'
+	@printf '%s\n' '  make receiver-devices   List receiver output devices'
+	@printf '%s\n' '  make sender-devices     List sender input devices'
+	@printf '%s\n' '  make check              Run fmt, clippy, and tests'
+	@printf '%s\n' ''
+	@printf '%s\n' 'Windows -> macOS:'
+	@printf '%s\n' '  1. make mac-ip'
+	@printf '%s\n' '  2. make p-receiver'
+	@printf '%s\n' '  3. Windows sender target: <mac-ip>:$(AUDIO_PORT)'
+	@printf '%s\n' '  feedback: make p-receiver RECEIVER_FEEDBACK_TARGET=<windows-ip>:$(FEEDBACK_PORT)'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Common overrides:'
-	@printf '%s\n' '  RECEIVER_OUTPUT_DEVICE="SOUNDPEATS Space"'
-	@printf '%s\n' '  SENDER_INPUT_DEVICE="BlackHole"'
+	@printf '%s\n' '  RECEIVER_OUTPUT_DEVICE="BlackHole 2ch"'
 	@printf '%s\n' '  FIXED_DELAY_FRAMES=14400'
 	@printf '%s\n' '  FIXED_DELAY_FRAMES= FIXED_LATENCY_MS=300'
+	@printf '%s\n' '  SENDER_TARGET=<remote-ip>:$(AUDIO_PORT)'
 
 receiver:
-	mise exec -- cargo run -p receiver -- \
-	  --listen $(AUDIO_ADDR) \
-	  --feedback-target $(FEEDBACK_ADDR) \
-	  $(FIXED_DELAY_ARGS) \
-	  --output audio \
-	  --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
-	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
-	  --output-ring-ms $(OUTPUT_RING_MS) \
-	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
-	  --render-chunk-ms $(RENDER_CHUNK_MS) \
-	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+	mise exec -- cargo run -p receiver -- $(RECEIVER_ARGS)
 
 receive: receiver
 
-fixed-receiver: FIXED_DELAY_FRAMES := 14400
-fixed-receiver: OUTPUT_RING_MS := 60
-fixed-receiver: OUTPUT_RING_CAPACITY_MS := 160
-fixed-receiver: RENDER_CHUNK_MS := 2
-fixed-receiver: OUTPUT_BUFFER_SIZE_FRAMES := 256
-fixed-receiver: receiver
-
-sender:
-	mise exec -- cargo run -p sender -- \
-	  --target $(AUDIO_ADDR) \
-	  --feedback-listen $(FEEDBACK_ADDR) \
-	  --input capture \
-	  --device "$(SENDER_INPUT_DEVICE)" \
-	  --packet-ms $(PACKET_MS) \
-	  --sender-side-asrc \
-	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
-
-fixed-sender: PACKET_MS := 5
-fixed-sender: sender
-
-
 p-receiver:
 	mise exec -- cargo build --release -p receiver
-	target/release/receiver \
-	  --listen $(AUDIO_ADDR) \
-	  --feedback-target $(FEEDBACK_ADDR) \
-	  $(FIXED_DELAY_ARGS) \
-	  --output audio \
-	  --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
-	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
-	  --output-ring-ms $(OUTPUT_RING_MS) \
-	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
-	  --render-chunk-ms $(RENDER_CHUNK_MS) \
-	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+	target/release/receiver $(RECEIVER_ARGS)
 
-p-fixed-receiver: FIXED_DELAY_FRAMES := 14400
-p-fixed-receiver: OUTPUT_RING_MS := 60
-p-fixed-receiver: OUTPUT_RING_CAPACITY_MS := 160
-p-fixed-receiver: RENDER_CHUNK_MS := 2
-p-fixed-receiver: OUTPUT_BUFFER_SIZE_FRAMES := 256
-p-fixed-receiver: p-receiver
-
+sender:
+	mise exec -- cargo run -p sender -- $(SENDER_ARGS)
 
 p-sender:
 	mise exec -- cargo build --release -p sender
-	target/release/sender \
-	  --target $(W_AUDIO_ADDR) \
-	  --feedback-listen $(W_FEEDBACK_ADDR) \
-	  --input capture \
-	  --device "$(SENDER_INPUT_DEVICE)" \
-	  --packet-ms $(PACKET_MS) \
-	  --sender-side-asrc \
-	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
+	target/release/sender $(SENDER_ARGS)
 
-p-fixed-sender: PACKET_MS := 5
-p-fixed-sender: p-sender
+mac-ip:
+	@for iface in en0 en8 en7 en6 en5 en4; do \
+	  ip=$$(ipconfig getifaddr $$iface 2>/dev/null || true); \
+	  if [ -n "$$ip" ]; then printf '%s %s:%s\n' "$$iface" "$$ip" "$(AUDIO_PORT)"; fi; \
+	done
 
-receiver-list:
+receiver-devices:
 	mise exec -- cargo run -p receiver -- --list-devices
 
-sender-list:
+sender-devices:
 	mise exec -- cargo run -p sender -- --list-devices
-
-receiver-devices: receiver-list
-
-sender-devices: sender-list
 
 build:
 	mise exec -- cargo build
