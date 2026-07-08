@@ -8,6 +8,4 @@ version.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.18"
-hound = "3.5"
 lan-audio-common = { path = "../common" }
-rand = "0.8"

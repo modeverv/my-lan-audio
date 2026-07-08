@@ -1,25 +1,18 @@
-mod audio_ring;
-
 use anyhow::{anyhow, bail, Context, Result};
-use audio_ring::SpscF32Ring;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24,
 };
 use crossbeam_queue::ArrayQueue;
-use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
-use lan_audio_common::audio::{f32_to_i16, CHANNELS, SAMPLE_RATE};
+use lan_audio_common::audio::{CHANNELS, SAMPLE_RATE};
 use lan_audio_common::jitter::{InsertOutcome, JitterBuffer, JitterConfig, JitterMetrics};
 use lan_audio_common::packet::AudioPacket;
 use lan_audio_common::status::ReceiverStatus;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::fs::File;
-use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,26 +28,14 @@ struct Args {
     #[arg(long)]
     feedback_target: Option<SocketAddr>,
 
-    #[arg(long, default_value = "null", value_parser = ["null", "audio", "wav"])]
-    output: String,
-
     #[arg(long)]
     output_device: Option<String>,
-
-    #[arg(long)]
-    output_file: Option<PathBuf>,
-
-    #[arg(long, default_value = "ring", value_parser = ["ring", "direct"])]
-    audio_path: String,
 
     #[arg(long, default_value = "off", value_parser = ["off", "packet", "on"])]
     clock_sync: String,
 
     #[arg(long)]
     list_devices: bool,
-
-    #[arg(long)]
-    test_tone: bool,
 
     #[arg(long, default_value_t = SAMPLE_RATE)]
     sample_rate: u32,
@@ -80,15 +61,6 @@ struct Args {
     #[arg(long)]
     output_sample_rate: Option<u32>,
 
-    #[arg(long, default_value_t = 40)]
-    output_ring_ms: u32,
-
-    #[arg(long, default_value_t = 200)]
-    output_ring_capacity_ms: u32,
-
-    #[arg(long, default_value_t = 5)]
-    render_chunk_ms: u32,
-
     #[arg(long, default_value_t = 1_048_576)]
     socket_recv_buffer_bytes: usize,
 
@@ -100,9 +72,6 @@ struct Args {
 
     #[arg(long, default_value_t = 1.0)]
     metrics_interval_sec: f64,
-
-    #[arg(long, default_value_t = 440.0)]
-    freq: f32,
 }
 
 fn main() -> Result<()> {
@@ -114,10 +83,6 @@ fn main() -> Result<()> {
         return list_output_devices();
     }
 
-    if args.test_tone {
-        return run_test_tone(&args);
-    }
-
     run_receiver(&args, timing)
 }
 
@@ -126,9 +91,6 @@ struct ReceiverTiming {
     capacity_ms: u32,
     target_buffer_ms: u32,
     fixed_delay_frames: u64,
-    output_ring_ms: u32,
-    output_ring_capacity_ms: u32,
-    render_chunk_ms: u32,
     output_buffer_size_frames: Option<u32>,
 }
 
@@ -151,9 +113,6 @@ impl ReceiverTiming {
             capacity_ms: fixed_delay_capacity_ms(fixed_delay_frames, args.sample_rate),
             target_buffer_ms: fixed_delay_ms,
             fixed_delay_frames,
-            output_ring_ms: args.output_ring_ms,
-            output_ring_capacity_ms: args.output_ring_capacity_ms,
-            render_chunk_ms: args.render_chunk_ms,
             output_buffer_size_frames: args.output_buffer_size_frames,
         })
     }
@@ -203,21 +162,6 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
     if args.output_buffer_size_frames == Some(0) {
         bail!("--output-buffer-size-frames must be greater than zero");
     }
-    if timing.output_ring_ms == 0
-        || timing.output_ring_capacity_ms == 0
-        || timing.render_chunk_ms == 0
-    {
-        bail!("output ring and render chunk timing values must be greater than zero");
-    }
-    if timing.output_ring_capacity_ms < timing.output_ring_ms + timing.render_chunk_ms {
-        bail!("--output-ring-capacity-ms must be at least --output-ring-ms + --render-chunk-ms");
-    }
-    if output_mode(args) == "audio" && args.audio_path == "ring" {
-        let output_ring_frames = ms_to_frames(timing.output_ring_ms, args.sample_rate);
-        if output_ring_frames > timing.fixed_delay_frames {
-            bail!("--output-ring-ms must fit within --fixed-delay-frames / --fixed-latency-ms");
-        }
-    }
     if args.packet_queue_capacity == 0 {
         bail!("--packet-queue-capacity must be greater than zero");
     }
@@ -231,10 +175,8 @@ fn clock_sync_enabled(clock_sync: &str) -> bool {
 fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
     let socket = bind_socket(args.listen, args.socket_recv_buffer_bytes)?;
     println!(
-        "receiver: listening={} output={} output_file={:?} fixed_delay={} capacity={}ms clock_sync={}",
+        "receiver: listening={} output=audio path=direct fixed_delay={} capacity={}ms clock_sync={}",
         args.listen,
-        output_mode(args),
-        args.output_file,
         format_fixed_delay(timing.fixed_delay_frames, args.sample_rate),
         timing.capacity_ms,
         args.clock_sync
@@ -258,41 +200,14 @@ fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
         Arc::clone(&ingress_metrics),
     );
 
-    match output_mode(args).as_str() {
-        "audio" => run_audio_output(
-            args,
-            timing,
-            jitter_config,
-            Arc::clone(&event_queue),
-            receiver_state,
-            Arc::clone(&ingress_metrics),
-        ),
-        "wav" => run_timed_pull_output(
-            args,
-            jitter_config,
-            Arc::clone(&event_queue),
-            receiver_state,
-            Arc::clone(&ingress_metrics),
-            args.output_file.as_deref(),
-        ),
-        "null" => run_timed_pull_output(
-            args,
-            jitter_config,
-            Arc::clone(&event_queue),
-            receiver_state,
-            Arc::clone(&ingress_metrics),
-            None,
-        ),
-        other => bail!("unsupported output mode {other}"),
-    }
-}
-
-fn output_mode(args: &Args) -> String {
-    if args.output_file.is_some() {
-        "wav".to_string()
-    } else {
-        args.output.clone()
-    }
+    run_audio_output(
+        args,
+        timing,
+        jitter_config,
+        Arc::clone(&event_queue),
+        receiver_state,
+        Arc::clone(&ingress_metrics),
+    )
 }
 
 fn bind_socket(addr: SocketAddr, recv_buffer_bytes: usize) -> Result<UdpSocket> {
@@ -315,8 +230,6 @@ enum ReceiverEvent {
 
 struct ReceiverEventQueue {
     events: ArrayQueue<ReceiverEvent>,
-    ready_lock: Mutex<()>,
-    ready: Condvar,
 }
 
 impl ReceiverEventQueue {
@@ -327,8 +240,6 @@ impl ReceiverEventQueue {
         );
         Self {
             events: ArrayQueue::new(capacity),
-            ready_lock: Mutex::new(()),
-            ready: Condvar::new(),
         }
     }
 
@@ -344,7 +255,6 @@ impl ReceiverEventQueue {
                 }
             }
         }
-        self.ready.notify_one();
         dropped_oldest
     }
 
@@ -352,26 +262,6 @@ impl ReceiverEventQueue {
         while let Some(event) = self.events.pop() {
             output.push(event);
         }
-    }
-
-    fn try_drain_into(&self, output: &mut Vec<ReceiverEvent>) -> bool {
-        self.drain_into(output);
-        true
-    }
-
-    fn wait_for_event_or_timeout(&self, timeout: Duration) {
-        if !self.events.is_empty() {
-            return;
-        }
-        let Ok(guard) = self.ready_lock.lock() else {
-            return;
-        };
-        if !self.events.is_empty() {
-            return;
-        }
-        let Ok((_guard, _timeout)) = self.ready.wait_timeout(guard, timeout) else {
-            return;
-        };
     }
 }
 
@@ -544,18 +434,6 @@ fn send_receiver_event(
     }
 }
 
-fn drain_receiver_events(
-    event_queue: &ReceiverEventQueue,
-    event_scratch: &mut Vec<ReceiverEvent>,
-    jitter: &mut JitterBuffer,
-    ingress_metrics: &IngressMetrics,
-) {
-    event_queue.drain_into(event_scratch);
-    for event in event_scratch.drain(..) {
-        process_receiver_event(event, jitter, ingress_metrics);
-    }
-}
-
 fn process_receiver_event(
     event: ReceiverEvent,
     jitter: &mut JitterBuffer,
@@ -568,69 +446,6 @@ fn process_receiver_event(
             ingress_metrics.record_stream_source(outcome, stream_id, source);
         }
         ReceiverEvent::InvalidPacket => jitter.record_invalid_packet(),
-    }
-}
-
-fn run_timed_pull_output(
-    args: &Args,
-    jitter_config: JitterConfig,
-    event_queue: Arc<ReceiverEventQueue>,
-    receiver_state: Arc<ReceiverState>,
-    ingress_metrics: Arc<IngressMetrics>,
-    output_file: Option<&Path>,
-) -> Result<()> {
-    let mut jitter = JitterBuffer::new(jitter_config);
-    let chunk_frames = (args.sample_rate / 100) as usize;
-    let channels = args.channels as usize;
-    let mut writer = if let Some(path) = output_file {
-        Some(
-            create_wav_writer(path, args.sample_rate)
-                .with_context(|| format!("failed to create {}", path.display()))?,
-        )
-    } else {
-        None
-    };
-    let feedback = FeedbackSender::new(args.feedback_target)?;
-    let mut metrics = MetricsPrinter::new(
-        args.metrics_interval_sec,
-        None,
-        feedback,
-        args.sample_rate,
-        args.channels,
-        Arc::clone(&receiver_state),
-        Arc::clone(&ingress_metrics),
-    );
-    let mut next_tick = Instant::now();
-    let start = Instant::now();
-    let mut output = vec![0.0f32; chunk_frames * channels];
-    let mut event_scratch = Vec::new();
-
-    loop {
-        if duration_elapsed(start, args.duration_sec) {
-            if let Some(writer) = writer {
-                writer.finalize().context("failed to finalize WAV output")?;
-            }
-            return Ok(());
-        }
-
-        drain_receiver_events(
-            &event_queue,
-            &mut event_scratch,
-            &mut jitter,
-            &ingress_metrics,
-        );
-        jitter.pull_f32_at_sample_rate_for_playout(&mut output, args.sample_rate, next_tick);
-        receiver_state.publish(&jitter);
-
-        if let Some(writer) = writer.as_mut() {
-            for sample in &output {
-                writer.write_sample(f32_to_i16(*sample))?;
-            }
-        }
-
-        metrics.maybe_print();
-        sleep_until(next_tick);
-        next_tick += Duration::from_millis(10);
     }
 }
 
@@ -659,57 +474,19 @@ fn run_audio_output(
     }
 
     println!(
-        "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?} buffer={:?} audio_path={}",
-        name,
-        config.sample_rate,
-        config.channels,
-        sample_format,
-        config.buffer_size,
-        args.audio_path
+        "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?} buffer={:?} audio_path=direct",
+        name, config.sample_rate, config.channels, sample_format, config.buffer_size
     );
 
-    let channels = usize::from(config.channels.max(1));
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
-    let stream = match args.audio_path.as_str() {
-        "ring" => {
-            let ring_capacity_samples =
-                samples_from_ms(config.sample_rate, channels, timing.output_ring_capacity_ms);
-            let ring = Arc::new(SpscF32Ring::new(ring_capacity_samples));
-            spawn_ring_renderer(
-                jitter_config,
-                event_queue,
-                Arc::clone(&ring),
-                Arc::clone(&callback_metrics),
-                Arc::clone(&receiver_state),
-                Arc::clone(&ingress_metrics),
-                RingRendererConfig {
-                    output_sample_rate: config.sample_rate,
-                    channels,
-                    output_ring_ms: timing.output_ring_ms,
-                    render_chunk_ms: timing.render_chunk_ms,
-                    realtime_priority: true,
-                },
-            );
-            build_ring_output_stream(
-                &device,
-                sample_format,
-                &config,
-                Arc::clone(&ring),
-                Arc::clone(&callback_metrics),
-            )?
-        }
-        "direct" => build_direct_output_stream(
-            &device,
-            sample_format,
-            &config,
-            jitter_config,
-            event_queue,
-            Arc::clone(&callback_metrics),
-            Arc::clone(&receiver_state),
-            Arc::clone(&ingress_metrics),
-        )?,
-        other => bail!("unsupported audio path {other}"),
+    let shared = DirectOutputShared {
+        event_queue,
+        callback_metrics: Arc::clone(&callback_metrics),
+        receiver_state: Arc::clone(&receiver_state),
+        ingress_metrics: Arc::clone(&ingress_metrics),
     };
+    let stream =
+        build_direct_output_stream(&device, sample_format, &config, jitter_config, shared)?;
     stream.play().context("failed to start output stream")?;
 
     let feedback = FeedbackSender::new(args.feedback_target)?;
@@ -732,99 +509,12 @@ fn run_audio_output(
     }
 }
 
-fn build_ring_output_stream(
-    device: &cpal::Device,
-    sample_format: SampleFormat,
-    config: &StreamConfig,
-    ring: Arc<SpscF32Ring>,
+#[derive(Clone)]
+struct DirectOutputShared {
+    event_queue: Arc<ReceiverEventQueue>,
     callback_metrics: Arc<OutputCallbackMetrics>,
-) -> Result<Stream> {
-    let stream = match sample_format {
-        SampleFormat::I8 => {
-            build_ring_output_stream_for::<i8>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::I16 => {
-            build_ring_output_stream_for::<i16>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::I24 => {
-            build_ring_output_stream_for::<I24>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::I32 => {
-            build_ring_output_stream_for::<i32>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::I64 => {
-            build_ring_output_stream_for::<i64>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::U8 => {
-            build_ring_output_stream_for::<u8>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::U16 => {
-            build_ring_output_stream_for::<u16>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::U24 => {
-            build_ring_output_stream_for::<U24>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::U32 => {
-            build_ring_output_stream_for::<u32>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::U64 => {
-            build_ring_output_stream_for::<u64>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::F32 => {
-            build_ring_output_stream_for::<f32>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::F64 => {
-            build_ring_output_stream_for::<f64>(device, config, ring, callback_metrics)?
-        }
-        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
-            bail!("DSD output sample format {sample_format:?} is not supported")
-        }
-        other => bail!("unsupported output sample format {other:?}"),
-    };
-    Ok(stream)
-}
-
-fn build_ring_output_stream_for<T>(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    ring: Arc<SpscF32Ring>,
-    callback_metrics: Arc<OutputCallbackMetrics>,
-) -> Result<Stream>
-where
-    T: Sample + SizedSample + FromSample<f32> + Send + 'static,
-{
-    let err_fn = |err| eprintln!("audio output stream error: {err}");
-    let channels = usize::from(config.channels.max(1));
-    let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
-    let mut last_frame = vec![0.0f32; channels];
-
-    Ok(device.build_output_stream(
-        *config,
-        move |data: &mut [T], _| {
-            callback_metrics.record_callback(data.len() / channels);
-            if data.len() > scratch.len() {
-                callback_metrics.record_scratch_overflow();
-                fill_with_last_frame(data, channels, &last_frame);
-                return;
-            }
-
-            let scratch = &mut scratch[..data.len()];
-            let popped = ring.pop_interleaved(scratch, channels);
-            callback_metrics.record_output_queue_samples(ring.len_samples());
-            if popped > 0 {
-                update_last_frame(&scratch[..popped], channels, &mut last_frame);
-            }
-            if popped < scratch.len() {
-                callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
-                fill_scratch_with_last_frame(&mut scratch[popped..], channels, &last_frame);
-            }
-            for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                *dst = output_sample(src);
-            }
-        },
-        err_fn,
-        None,
-    )?)
+    receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
 }
 
 fn build_direct_output_stream(
@@ -832,120 +522,45 @@ fn build_direct_output_stream(
     sample_format: SampleFormat,
     config: &StreamConfig,
     jitter_config: JitterConfig,
-    event_queue: Arc<ReceiverEventQueue>,
-    callback_metrics: Arc<OutputCallbackMetrics>,
-    receiver_state: Arc<ReceiverState>,
-    ingress_metrics: Arc<IngressMetrics>,
+    shared: DirectOutputShared,
 ) -> Result<Stream> {
     let stream = match sample_format {
-        SampleFormat::I8 => build_direct_output_stream_for::<i8>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::I16 => build_direct_output_stream_for::<i16>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::I24 => build_direct_output_stream_for::<I24>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::I32 => build_direct_output_stream_for::<i32>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::I64 => build_direct_output_stream_for::<i64>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::U8 => build_direct_output_stream_for::<u8>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::U16 => build_direct_output_stream_for::<u16>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::U24 => build_direct_output_stream_for::<U24>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::U32 => build_direct_output_stream_for::<u32>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::U64 => build_direct_output_stream_for::<u64>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::F32 => build_direct_output_stream_for::<f32>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
-        SampleFormat::F64 => build_direct_output_stream_for::<f64>(
-            device,
-            config,
-            jitter_config,
-            event_queue,
-            callback_metrics,
-            receiver_state,
-            ingress_metrics,
-        )?,
+        SampleFormat::I8 => {
+            build_direct_output_stream_for::<i8>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::I16 => {
+            build_direct_output_stream_for::<i16>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::I24 => {
+            build_direct_output_stream_for::<I24>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::I32 => {
+            build_direct_output_stream_for::<i32>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::I64 => {
+            build_direct_output_stream_for::<i64>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::U8 => {
+            build_direct_output_stream_for::<u8>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::U16 => {
+            build_direct_output_stream_for::<u16>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::U24 => {
+            build_direct_output_stream_for::<U24>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::U32 => {
+            build_direct_output_stream_for::<u32>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::U64 => {
+            build_direct_output_stream_for::<u64>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::F32 => {
+            build_direct_output_stream_for::<f32>(device, config, jitter_config, shared)?
+        }
+        SampleFormat::F64 => {
+            build_direct_output_stream_for::<f64>(device, config, jitter_config, shared)?
+        }
         SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
             bail!("DSD output sample format {sample_format:?} is not supported")
         }
@@ -958,10 +573,7 @@ fn build_direct_output_stream_for<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     jitter_config: JitterConfig,
-    event_queue: Arc<ReceiverEventQueue>,
-    callback_metrics: Arc<OutputCallbackMetrics>,
-    receiver_state: Arc<ReceiverState>,
-    ingress_metrics: Arc<IngressMetrics>,
+    shared: DirectOutputShared,
 ) -> Result<Stream>
 where
     T: Sample + SizedSample + FromSample<f32> + Send + 'static,
@@ -973,6 +585,10 @@ where
     let mut event_scratch = Vec::with_capacity(256);
     let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
     let mut last_frame = vec![0.0f32; channels];
+    let event_queue = shared.event_queue;
+    let callback_metrics = shared.callback_metrics;
+    let receiver_state = shared.receiver_state;
+    let ingress_metrics = shared.ingress_metrics;
 
     Ok(device.build_output_stream(
         *config,
@@ -984,12 +600,9 @@ where
                 return;
             }
 
-            if event_queue.try_drain_into(&mut event_scratch) {
-                for event in event_scratch.drain(..) {
-                    process_receiver_event(event, &mut jitter, &ingress_metrics);
-                }
-            } else {
-                callback_metrics.record_lock_miss();
+            event_queue.drain_into(&mut event_scratch);
+            for event in event_scratch.drain(..) {
+                process_receiver_event(event, &mut jitter, &ingress_metrics);
             }
 
             let scratch = &mut scratch[..data.len()];
@@ -1013,138 +626,12 @@ where
     )?)
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RingRendererConfig {
-    output_sample_rate: u32,
-    channels: usize,
-    output_ring_ms: u32,
-    render_chunk_ms: u32,
-    realtime_priority: bool,
-}
-
-fn spawn_ring_renderer(
-    jitter_config: JitterConfig,
-    event_queue: Arc<ReceiverEventQueue>,
-    ring: Arc<SpscF32Ring>,
-    metrics: Arc<OutputCallbackMetrics>,
-    receiver_state: Arc<ReceiverState>,
-    ingress_metrics: Arc<IngressMetrics>,
-    config: RingRendererConfig,
-) {
-    let spawn_result = thread::Builder::new()
-        .name("receiver-ring-renderer".to_string())
-        .spawn(move || {
-            if config.realtime_priority {
-                raise_renderer_thread_priority();
-            }
-            let mut jitter = JitterBuffer::new(jitter_config);
-            let channels = config.channels.max(1);
-            let target_frames =
-                (config.output_sample_rate as usize * config.output_ring_ms as usize / 1000).max(1);
-            let target_samples = target_frames.saturating_mul(channels);
-            let chunk_frames =
-                (config.output_sample_rate as usize * config.render_chunk_ms as usize / 1000)
-                    .max(1);
-            let mut render_scratch = vec![0.0f32; chunk_frames * channels];
-            let mut event_scratch = Vec::new();
-            let sleep_divisor = 2;
-            let min_sleep_us = 1_000;
-            let max_sleep_duration = Duration::from_micros(
-                ((config.render_chunk_ms as u64 * 1000) / sleep_divisor).max(min_sleep_us),
-            );
-
-            loop {
-                drain_receiver_events(
-                    &event_queue,
-                    &mut event_scratch,
-                    &mut jitter,
-                    &ingress_metrics,
-                );
-                let queued_source_frames = output_frames_to_source_frames_ceil(
-                    ring.len_samples() / channels,
-                    config.output_sample_rate,
-                );
-                jitter.trim_to_playout_buffer_budget(queued_source_frames);
-                loop {
-                    let queued = ring.len_samples();
-                    metrics.record_output_queue_samples(queued);
-                    if queued >= target_samples {
-                        metrics.mark_ring_ready();
-                        break;
-                    }
-
-                    let missing_samples = target_samples - queued;
-                    let frames_to_render = (missing_samples / channels).min(chunk_frames);
-                    if frames_to_render == 0 {
-                        break;
-                    }
-                    let sample_count = frames_to_render * channels;
-                    let scratch = &mut render_scratch[..sample_count];
-
-                    let queued_frames_after_render = (queued / channels) + frames_to_render;
-                    let playout_buffered_after_pull_frames = output_frames_to_source_frames_ceil(
-                        queued_frames_after_render,
-                        config.output_sample_rate,
-                    );
-                    jitter.pull_f32_at_sample_rate_with_playout_clock(
-                        scratch,
-                        config.output_sample_rate,
-                        playout_buffered_after_pull_frames,
-                        Some(Instant::now()),
-                    );
-
-                    let pushed = ring.push_interleaved(scratch, channels);
-                    if pushed < sample_count {
-                        metrics.record_ring_overflow((sample_count - pushed) / channels);
-                        break;
-                    }
-                }
-
-                receiver_state.publish(&jitter);
-                let sleep_duration = renderer_sleep_duration(
-                    ring.len_samples() / channels,
-                    target_frames,
-                    chunk_frames,
-                    config.output_sample_rate,
-                    max_sleep_duration,
-                );
-                event_queue.wait_for_event_or_timeout(sleep_duration);
-            }
-        });
-
-    if let Err(err) = spawn_result {
-        eprintln!("receiver: failed to spawn ring renderer thread: {err}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn raise_renderer_thread_priority() {
-    unsafe {
-        let result =
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-        if result != 0 {
-            eprintln!("receiver: failed to raise renderer thread QoS: {result}");
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn raise_renderer_thread_priority() {}
-
 fn update_last_frame(samples: &[f32], channels: usize, last_frame: &mut [f32]) {
     if samples.len() < channels || last_frame.len() < channels {
         return;
     }
     let start = samples.len() - channels;
     last_frame[..channels].copy_from_slice(&samples[start..start + channels]);
-}
-
-fn fill_scratch_with_last_frame(data: &mut [f32], channels: usize, last_frame: &[f32]) {
-    for frame in data.chunks_exact_mut(channels) {
-        for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
-            *dst = src;
-        }
-    }
 }
 
 fn fill_with_last_frame<T>(data: &mut [T], channels: usize, last_frame: &[f32])
@@ -1165,38 +652,6 @@ where
     T::from_sample(sample.clamp(-1.0, 1.0))
 }
 
-fn samples_from_ms(sample_rate: u32, channels: usize, ms: u32) -> usize {
-    let channels = channels.max(1);
-    ((sample_rate as usize * ms as usize / 1000).max(1)).saturating_mul(channels)
-}
-
-fn output_frames_to_source_frames_ceil(output_frames: usize, output_sample_rate: u32) -> u64 {
-    let output_sample_rate = u64::from(output_sample_rate.max(1));
-    (output_frames as u64)
-        .saturating_mul(u64::from(SAMPLE_RATE))
-        .saturating_add(output_sample_rate - 1)
-        / output_sample_rate
-}
-
-fn renderer_sleep_duration(
-    queued_frames: usize,
-    target_frames: usize,
-    chunk_frames: usize,
-    output_sample_rate: u32,
-    max_sleep: Duration,
-) -> Duration {
-    let sample_rate = output_sample_rate.max(1) as u128;
-    let low_water_frames = target_frames.saturating_sub(chunk_frames.max(1));
-    let frames_until_low_water = queued_frames.saturating_sub(low_water_frames);
-    let micros_until_low_water = (frames_until_low_water as u128)
-        .saturating_mul(1_000_000)
-        .checked_div(sample_rate)
-        .unwrap_or(0);
-    let max_sleep_us = max_sleep.as_micros().max(250);
-    let sleep_us = (micros_until_low_water / 2).clamp(250, max_sleep_us);
-    Duration::from_micros(sleep_us as u64)
-}
-
 fn scratch_len_for_stream(config: &StreamConfig) -> usize {
     let channels = usize::from(config.channels.max(1));
     let frames = match config.buffer_size {
@@ -1208,151 +663,19 @@ fn scratch_len_for_stream(config: &StreamConfig) -> usize {
     frames.saturating_mul(channels)
 }
 
-fn run_test_tone(args: &Args) -> Result<()> {
-    if let Some(path) = &args.output_file {
-        let duration = args.duration_sec.unwrap_or(3.0);
-        let mut writer = create_wav_writer(path, args.sample_rate)?;
-        let total_frames = (args.sample_rate as f64 * duration) as usize;
-        let mut phase = 0.0f32;
-        let step = args.freq * std::f32::consts::TAU / args.sample_rate as f32;
-        for _ in 0..total_frames {
-            let sample = phase.sin() * 0.2;
-            phase = (phase + step) % std::f32::consts::TAU;
-            writer.write_sample(f32_to_i16(sample))?;
-            writer.write_sample(f32_to_i16(sample))?;
-        }
-        writer.finalize()?;
-        return Ok(());
-    }
-
-    let host = cpal::default_host();
-    let device = select_output_device(&host, args.output_device.as_deref())?;
-    let name = device.to_string();
-    let supported = device
-        .default_output_config()
-        .context("failed to get default output config")?;
-    let sample_format = supported.sample_format();
-    let mut config = supported.config();
-    config.channels = args.channels;
-    let phase = Arc::new(Mutex::new(0.0f32));
-
-    println!(
-        "receiver: test_tone output_device=\"{}\" output_format={}Hz/{}ch/{:?}",
-        name, config.sample_rate, config.channels, sample_format
-    );
-    let stream = build_tone_output_stream(&device, sample_format, &config, phase, args.freq)?;
-    stream.play().context("failed to start output stream")?;
-
-    let start = Instant::now();
-    loop {
-        if duration_elapsed(start, args.duration_sec) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn build_tone_output_stream(
-    device: &cpal::Device,
-    sample_format: SampleFormat,
-    config: &StreamConfig,
-    phase: Arc<Mutex<f32>>,
-    freq: f32,
-) -> Result<Stream> {
-    let stream = match sample_format {
-        SampleFormat::I8 => build_tone_output_stream_for::<i8>(device, config, phase, freq)?,
-        SampleFormat::I16 => build_tone_output_stream_for::<i16>(device, config, phase, freq)?,
-        SampleFormat::I24 => build_tone_output_stream_for::<I24>(device, config, phase, freq)?,
-        SampleFormat::I32 => build_tone_output_stream_for::<i32>(device, config, phase, freq)?,
-        SampleFormat::I64 => build_tone_output_stream_for::<i64>(device, config, phase, freq)?,
-        SampleFormat::U8 => build_tone_output_stream_for::<u8>(device, config, phase, freq)?,
-        SampleFormat::U16 => build_tone_output_stream_for::<u16>(device, config, phase, freq)?,
-        SampleFormat::U24 => build_tone_output_stream_for::<U24>(device, config, phase, freq)?,
-        SampleFormat::U32 => build_tone_output_stream_for::<u32>(device, config, phase, freq)?,
-        SampleFormat::U64 => build_tone_output_stream_for::<u64>(device, config, phase, freq)?,
-        SampleFormat::F32 => build_tone_output_stream_for::<f32>(device, config, phase, freq)?,
-        SampleFormat::F64 => build_tone_output_stream_for::<f64>(device, config, phase, freq)?,
-        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
-            bail!("DSD output sample format {sample_format:?} is not supported")
-        }
-        other => bail!("unsupported output sample format {other:?}"),
-    };
-    Ok(stream)
-}
-
-fn build_tone_output_stream_for<T>(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    phase: Arc<Mutex<f32>>,
-    freq: f32,
-) -> Result<Stream>
-where
-    T: Sample + SizedSample + FromSample<f32> + Send + 'static,
-{
-    let sample_rate = config.sample_rate;
-    let channels = usize::from(config.channels.max(1));
-    let err_fn = |err| eprintln!("audio output stream error: {err}");
-
-    Ok(device.build_output_stream(
-        *config,
-        move |data: &mut [T], _| fill_tone(data, channels, sample_rate, freq, &phase),
-        err_fn,
-        None,
-    )?)
-}
-
-fn fill_tone<T>(
-    data: &mut [T],
-    channels: usize,
-    sample_rate: u32,
-    freq: f32,
-    phase: &Arc<Mutex<f32>>,
-) where
-    T: Sample + FromSample<f32>,
-{
-    let mut phase = match phase.try_lock() {
-        Ok(phase) => phase,
-        Err(_) => {
-            data.fill(T::EQUILIBRIUM);
-            return;
-        }
-    };
-    let step = freq * std::f32::consts::TAU / sample_rate as f32;
-    for frame in data.chunks_exact_mut(channels) {
-        let sample = output_sample(phase.sin() * 0.2);
-        *phase = (*phase + step) % std::f32::consts::TAU;
-        frame[0] = sample;
-        if channels > 1 {
-            frame[1] = sample;
-        }
-        for extra in frame.iter_mut().skip(2) {
-            *extra = T::EQUILIBRIUM;
-        }
-    }
-}
-
 #[derive(Default)]
 struct OutputCallbackMetrics {
     callbacks: AtomicU64,
     frames: AtomicU64,
-    lock_misses: AtomicU64,
     scratch_overflows: AtomicU64,
-    ring_underruns: AtomicU64,
-    ring_missing_frames: AtomicU64,
-    ring_overflows: AtomicU64,
     output_queue_samples: AtomicU64,
-    ring_ready: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct OutputCallbackSnapshot {
     callbacks: u64,
     frames: u64,
-    lock_misses: u64,
     scratch_overflows: u64,
-    ring_underruns: u64,
-    ring_missing_frames: u64,
-    ring_overflows: u64,
     output_queue_samples: u64,
 }
 
@@ -1362,26 +685,8 @@ impl OutputCallbackMetrics {
         self.frames.fetch_add(frames as u64, Ordering::Relaxed);
     }
 
-    fn record_lock_miss(&self) {
-        self.lock_misses.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn record_scratch_overflow(&self) {
         self.scratch_overflows.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_ring_underrun(&self, missing_frames: usize) {
-        if !self.ring_ready.load(Ordering::Relaxed) {
-            return;
-        }
-        self.ring_underruns.fetch_add(1, Ordering::Relaxed);
-        self.ring_missing_frames
-            .fetch_add(missing_frames as u64, Ordering::Relaxed);
-    }
-
-    fn record_ring_overflow(&self, dropped_frames: usize) {
-        self.ring_overflows
-            .fetch_add(dropped_frames as u64, Ordering::Relaxed);
     }
 
     fn record_output_queue_samples(&self, samples: usize) {
@@ -1389,19 +694,11 @@ impl OutputCallbackMetrics {
             .store(samples as u64, Ordering::Relaxed);
     }
 
-    fn mark_ring_ready(&self) {
-        self.ring_ready.store(true, Ordering::Relaxed);
-    }
-
     fn snapshot(&self) -> OutputCallbackSnapshot {
         OutputCallbackSnapshot {
             callbacks: self.callbacks.load(Ordering::Relaxed),
             frames: self.frames.load(Ordering::Relaxed),
-            lock_misses: self.lock_misses.load(Ordering::Relaxed),
             scratch_overflows: self.scratch_overflows.load(Ordering::Relaxed),
-            ring_underruns: self.ring_underruns.load(Ordering::Relaxed),
-            ring_missing_frames: self.ring_missing_frames.load(Ordering::Relaxed),
-            ring_overflows: self.ring_overflows.load(Ordering::Relaxed),
             output_queue_samples: self.output_queue_samples.load(Ordering::Relaxed),
         }
     }
@@ -1508,21 +805,9 @@ impl MetricsPrinter {
         let callback_frames_delta = callback_metrics
             .frames
             .saturating_sub(self.last_callback_metrics.frames);
-        let lock_miss_delta = callback_metrics
-            .lock_misses
-            .saturating_sub(self.last_callback_metrics.lock_misses);
         let scratch_overflow_delta = callback_metrics
             .scratch_overflows
             .saturating_sub(self.last_callback_metrics.scratch_overflows);
-        let ring_underrun_delta = callback_metrics
-            .ring_underruns
-            .saturating_sub(self.last_callback_metrics.ring_underruns);
-        let ring_missing_delta = callback_metrics
-            .ring_missing_frames
-            .saturating_sub(self.last_callback_metrics.ring_missing_frames);
-        let ring_overflow_delta = callback_metrics
-            .ring_overflows
-            .saturating_sub(self.last_callback_metrics.ring_overflows);
         let output_queue_ms = callback_metrics.output_queue_samples as f64 * 1000.0
             / self.output_sample_rate.max(1) as f64
             / self.output_channels.max(1) as f64;
@@ -1542,7 +827,7 @@ impl MetricsPrinter {
         let foreign_source = format_source(ingress.foreign_source);
         let foreign_stream = format_stream_id(ingress.foreign_stream_id);
         println!(
-            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s foreign={:.1}/s src={} stream={} foreign_src={} foreign_stream={} buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s foreign={:.1}/s src={} stream={} foreign_src={} foreign_stream={} buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             queued_packet_delta as f64 / elapsed,
@@ -1574,10 +859,6 @@ impl MetricsPrinter {
             (metrics.missing_frames - previous.missing_frames) as f64 / elapsed,
             callback_delta as f64 / elapsed,
             callback_frames_delta as f64 / elapsed,
-            lock_miss_delta as f64 / elapsed,
-            ring_underrun_delta as f64 / elapsed,
-            ring_missing_delta as f64 / elapsed,
-            ring_overflow_delta as f64 / elapsed,
             scratch_overflow_delta as f64 / elapsed,
             metrics.resyncs,
             metrics.resyncs_by_stream_change,
@@ -1595,11 +876,11 @@ impl MetricsPrinter {
                 received_packets: metrics.received_packets,
                 steady_underruns: metrics.steady_underruns,
                 startup_underruns: metrics.startup_underruns,
-                callback_lock_misses: callback_metrics.lock_misses,
+                callback_lock_misses: 0,
                 resyncs: metrics.resyncs,
                 scratch_overflows: callback_metrics.scratch_overflows,
-                ring_underruns: callback_metrics.ring_underruns,
-                ring_missing_frames: callback_metrics.ring_missing_frames,
+                ring_underruns: 0,
+                ring_missing_frames: 0,
                 packet_queue_drops: ingress.queue_drops,
                 audio_latency_frames: metrics.buffer_level_frames,
                 output_queue_frames,
@@ -1674,27 +955,10 @@ fn list_output_devices() -> Result<()> {
     Ok(())
 }
 
-fn create_wav_writer(path: &Path, sample_rate: u32) -> Result<WavWriter<BufWriter<File>>> {
-    let spec = WavSpec {
-        channels: CHANNELS,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: WavSampleFormat::Int,
-    };
-    Ok(WavWriter::create(path, spec)?)
-}
-
 fn duration_elapsed(start: Instant, duration_sec: Option<f64>) -> bool {
     duration_sec
         .map(|duration| start.elapsed() >= Duration::from_secs_f64(duration.max(0.0)))
         .unwrap_or(false)
-}
-
-fn sleep_until(deadline: Instant) {
-    let now = Instant::now();
-    if deadline > now {
-        thread::sleep(deadline - now);
-    }
 }
 
 #[cfg(test)]
@@ -1705,27 +969,19 @@ mod tests {
         Args {
             listen: "0.0.0.0:50000".parse().unwrap(),
             feedback_target: None,
-            output: "null".to_string(),
             output_device: None,
-            output_file: None,
-            audio_path: "ring".to_string(),
             clock_sync: "off".to_string(),
             list_devices: false,
-            test_tone: false,
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
             fixed_delay_frames: None,
             fixed_latency_ms: None,
             output_buffer_size_frames: None,
             output_sample_rate: None,
-            output_ring_ms: 40,
-            output_ring_capacity_ms: 200,
-            render_chunk_ms: 5,
             socket_recv_buffer_bytes: 1_048_576,
             packet_queue_capacity: 2048,
             duration_sec: None,
             metrics_interval_sec: 1.0,
-            freq: 440.0,
         }
     }
 
@@ -1784,30 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_output_ring_must_fit_inside_fixed_delay() {
-        let mut args = default_args();
-        args.output = "audio".to_string();
-        args.fixed_latency_ms = Some(20);
-        args.output_ring_ms = 40;
-        args.output_ring_capacity_ms = 80;
-        let timing = ReceiverTiming::from_args(&args).unwrap();
-
-        assert!(validate_audio_args(&args, &timing).is_err());
-    }
-
-    #[test]
-    fn direct_audio_path_does_not_require_output_ring_inside_fixed_delay() {
-        let mut args = default_args();
-        args.output = "audio".to_string();
-        args.audio_path = "direct".to_string();
-        args.fixed_latency_ms = Some(1);
-        args.output_ring_ms = 40;
-        let timing = ReceiverTiming::from_args(&args).unwrap();
-
-        validate_audio_args(&args, &timing).unwrap();
-    }
-
-    #[test]
     fn receiver_event_queue_drops_oldest_when_full() {
         let queue = ReceiverEventQueue::new(2);
 
@@ -1818,19 +1050,5 @@ mod tests {
         let mut events = Vec::new();
         queue.drain_into(&mut events);
         assert_eq!(events.len(), 2);
-    }
-
-    #[test]
-    fn renderer_sleep_wakes_near_low_watermark() {
-        let max_sleep = Duration::from_micros(2_500);
-
-        assert_eq!(
-            renderer_sleep_duration(1_920, 1_920, 240, SAMPLE_RATE, max_sleep),
-            max_sleep
-        );
-        assert_eq!(
-            renderer_sleep_duration(1_680, 1_920, 240, SAMPLE_RATE, max_sleep),
-            Duration::from_micros(250)
-        );
     }
 }
