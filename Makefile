@@ -1,7 +1,7 @@
 .PHONY: help receive receiver sender fixed-receiver fixed-sender p-receiver p-receiver-tmp p-sender p-fixed-receiver p-fixed-sender w-sender release receiver-list sender-list receiver-devices sender-devices build test check
 
 AUDIO_ADDR ?= 0.0.0.0:50000
-FEEDBACK_ADDR ?= 192.168.11.51:50001
+FEEDBACK_ADDR ?= 192.168.11.28:50001
 
 # TODO change to windows pc ip
 W_AUDIO_ADDR ?= 192.168.11.65:50000
