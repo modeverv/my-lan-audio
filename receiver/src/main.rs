@@ -47,6 +47,9 @@ struct Args {
     #[arg(long, default_value = "ring", value_parser = ["ring", "direct"])]
     audio_path: String,
 
+    #[arg(long, default_value = "off", value_parser = ["off", "packet"])]
+    clock_sync: String,
+
     #[arg(long)]
     list_devices: bool,
 
@@ -224,12 +227,13 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
 fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
     let socket = bind_socket(args.listen, args.socket_recv_buffer_bytes)?;
     println!(
-        "receiver: listening={} output={} output_file={:?} fixed_delay={} capacity={}ms",
+        "receiver: listening={} output={} output_file={:?} fixed_delay={} capacity={}ms clock_sync={}",
         args.listen,
         output_mode(args),
         args.output_file,
         format_fixed_delay(timing.fixed_delay_frames, args.sample_rate),
-        timing.capacity_ms
+        timing.capacity_ms,
+        args.clock_sync
     );
 
     let jitter_config = JitterConfig {
@@ -238,6 +242,7 @@ fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
         capacity_ms: timing.capacity_ms,
         target_ms: timing.target_buffer_ms,
         fixed_delay_frames: timing.fixed_delay_frames,
+        clock_sync: args.clock_sync == "packet",
     };
     let event_queue = Arc::new(ReceiverEventQueue::new(args.packet_queue_capacity));
     let ingress_metrics = Arc::new(IngressMetrics::default());
@@ -985,7 +990,12 @@ where
 
             let scratch = &mut scratch[..data.len()];
             jitter.trim_to_playout_buffer_budget(0);
-            jitter.pull_f32_at_sample_rate_with_playout_buffer(scratch, output_sample_rate, 0);
+            jitter.pull_f32_at_sample_rate_with_playout_clock(
+                scratch,
+                output_sample_rate,
+                0,
+                Some(Instant::now()),
+            );
             callback_metrics.record_output_queue_samples(0);
             update_last_frame(scratch, channels, &mut last_frame);
             receiver_state.publish(&jitter);
@@ -1072,10 +1082,11 @@ fn spawn_ring_renderer(
                         queued_frames_after_render,
                         config.output_sample_rate,
                     );
-                    jitter.pull_f32_at_sample_rate_with_playout_buffer(
+                    jitter.pull_f32_at_sample_rate_with_playout_clock(
                         scratch,
                         config.output_sample_rate,
                         playout_buffered_after_pull_frames,
+                        Some(Instant::now()),
                     );
 
                     let pushed = ring.push_interleaved(scratch, channels);
@@ -1694,6 +1705,7 @@ mod tests {
             output_device: None,
             output_file: None,
             audio_path: "ring".to_string(),
+            clock_sync: "off".to_string(),
             list_devices: false,
             test_tone: false,
             sample_rate: SAMPLE_RATE,

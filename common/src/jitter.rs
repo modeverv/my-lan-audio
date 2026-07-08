@@ -14,6 +14,7 @@ pub struct JitterConfig {
     pub capacity_ms: u32,
     pub target_ms: u32,
     pub fixed_delay_frames: u64,
+    pub clock_sync: bool,
 }
 
 impl Default for JitterConfig {
@@ -24,6 +25,7 @@ impl Default for JitterConfig {
             capacity_ms: 1000,
             target_ms: 300,
             fixed_delay_frames: 14_400,
+            clock_sync: false,
         }
     }
 }
@@ -124,6 +126,12 @@ struct PacketFrames {
     frame_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ClockSyncAnchor {
+    sample_position: u64,
+    arrival: Instant,
+}
+
 #[derive(Debug)]
 pub struct JitterBuffer {
     config: JitterConfig,
@@ -136,6 +144,7 @@ pub struct JitterBuffer {
     first_drift_sample: Option<u64>,
     first_drift_arrival: Option<Instant>,
     last_stream_arrival: Option<Instant>,
+    clock_sync_anchor: Option<ClockSyncAnchor>,
     consecutive_missing_frames: u64,
     metrics: JitterMetrics,
 }
@@ -153,6 +162,7 @@ impl JitterBuffer {
             first_drift_sample: None,
             first_drift_arrival: None,
             last_stream_arrival: None,
+            clock_sync_anchor: None,
             consecutive_missing_frames: 0,
             metrics: JitterMetrics::default(),
         }
@@ -216,6 +226,7 @@ impl JitterBuffer {
         self.metrics.latest_sample_position = Some(start);
         self.last_stream_arrival = Some(arrival);
         self.update_drift_estimate(start, arrival);
+        self.update_clock_sync_anchor(start, arrival);
         self.drop_over_capacity();
         self.refresh_metrics();
         outcome
@@ -249,10 +260,26 @@ impl JitterBuffer {
         output_sample_rate: u32,
         playout_buffered_after_pull_frames: u64,
     ) {
+        self.pull_f32_at_sample_rate_with_playout_clock(
+            output,
+            output_sample_rate,
+            playout_buffered_after_pull_frames,
+            None,
+        );
+    }
+
+    pub fn pull_f32_at_sample_rate_with_playout_clock(
+        &mut self,
+        output: &mut [f32],
+        output_sample_rate: u32,
+        playout_buffered_after_pull_frames: u64,
+        playout_time: Option<Instant>,
+    ) {
         self.pull_fixed_f32_at_sample_rate(
             output,
             output_sample_rate,
             playout_buffered_after_pull_frames,
+            playout_time,
         );
     }
 
@@ -261,6 +288,7 @@ impl JitterBuffer {
         output: &mut [f32],
         output_sample_rate: u32,
         playout_buffered_after_pull_frames: u64,
+        playout_time: Option<Instant>,
     ) {
         output.fill(0.0);
         if output.is_empty() || self.config.channels == 0 {
@@ -277,6 +305,15 @@ impl JitterBuffer {
             self.config.sample_rate,
             output_sample_rate,
         );
+        if self.config.clock_sync {
+            if let Some(playout_time) = playout_time {
+                self.sync_read_pos_to_playout_clock(
+                    playout_time,
+                    playout_buffered_after_pull_frames,
+                    source_frames_to_render,
+                );
+            }
+        }
         let desired_after_pull = self
             .config
             .fixed_delay_frames
@@ -439,6 +476,50 @@ impl JitterBuffer {
         }
     }
 
+    fn update_clock_sync_anchor(&mut self, sample_position: u64, arrival: Instant) {
+        if self.clock_sync_anchor.is_none() {
+            self.clock_sync_anchor = Some(ClockSyncAnchor {
+                sample_position,
+                arrival,
+            });
+        }
+    }
+
+    fn sync_read_pos_to_playout_clock(
+        &mut self,
+        playout_time: Instant,
+        playout_buffered_after_pull_frames: u64,
+        source_frames_to_render: u64,
+    ) {
+        let Some(anchor) = self.clock_sync_anchor else {
+            return;
+        };
+        let Some(elapsed) = playout_time.checked_duration_since(anchor.arrival) else {
+            return;
+        };
+
+        let drift_ratio = 1.0 + f64::from(self.metrics.estimated_drift_ppm) / 1_000_000.0;
+        let sender_frames_since_anchor =
+            elapsed.as_secs_f64() * self.config.sample_rate as f64 * drift_ratio;
+        let delay_frames = self
+            .config
+            .fixed_delay_frames
+            .saturating_sub(playout_buffered_after_pull_frames)
+            .saturating_add(source_frames_to_render) as f64;
+        let target_read_pos =
+            anchor.sample_position as f64 + sender_frames_since_anchor - delay_frames;
+        if !target_read_pos.is_finite() || target_read_pos <= self.read_pos {
+            return;
+        }
+
+        let latest_safe_pos = self.latest_received_end.saturating_sub(2) as f64;
+        let target_read_pos = target_read_pos.min(latest_safe_pos).max(0.0);
+        if target_read_pos > self.read_pos {
+            self.read_pos = target_read_pos;
+            self.consecutive_missing_frames = 0;
+        }
+    }
+
     fn current_stream_is_active(&self, arrival: Instant) -> bool {
         self.last_stream_arrival
             .and_then(|last| arrival.checked_duration_since(last))
@@ -543,6 +624,7 @@ impl JitterBuffer {
         self.first_drift_sample = None;
         self.first_drift_arrival = None;
         self.last_stream_arrival = None;
+        self.clock_sync_anchor = None;
         self.consecutive_missing_frames = 0;
         self.state = JitterState::Resync;
         self.metrics.resyncs += 1;
@@ -963,5 +1045,27 @@ mod tests {
 
         buffer.trim_to_playout_buffer_budget(1_920);
         assert_eq!(buffer.metrics().buffer_level_frames, 2_880);
+    }
+
+    #[test]
+    fn packet_clock_sync_accounts_for_current_render_span() {
+        let t0 = Instant::now();
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            target_ms: 1,
+            fixed_delay_frames: 12,
+            clock_sync: true,
+            ..JitterConfig::default()
+        });
+        for sequence in 0..30 {
+            buffer.insert_packet(
+                packet(sequence, sequence as u64 * 240),
+                t0 + Duration::from_millis(sequence as u64 * 5),
+            );
+        }
+
+        buffer.sync_read_pos_to_playout_clock(t0 + Duration::from_millis(50), 6, 24);
+
+        let expected = 2_400.0 - (12.0 - 6.0 + 24.0);
+        assert!((buffer.read_pos - expected).abs() < 0.5);
     }
 }

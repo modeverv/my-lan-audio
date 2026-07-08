@@ -7,7 +7,7 @@
 ## 現在の状態
 
 2026-07-07 時点の実装は macOS-first で安定性改善まで入っています。
-2026-07-08 に Windows/MSVC host での build check、WASAPI デバイス一覧確認、Windows 向け PowerShell launcher、CPAL の PCM/float sample format 対応拡張を追加しました。
+2026-07-08 に Windows/MSVC host での build check、WASAPI デバイス一覧確認、Windows 向け PowerShell launcher、CPAL の PCM/float sample format 対応拡張を追加しました。同日に localhost 低レイテンシー検証用として、receiver の direct audio path と packet arrival clock sync も追加しています。
 
 実装済み:
 
@@ -20,11 +20,12 @@
 - jitter buffer, loss / late / duplicate / out-of-order metrics
 - fixed-buffer playout scheduler: `--fixed-delay-frames <FRAMES>` は receiver 内部の `jitter + output ring` 合算予算。`--fixed-latency-ms <MS>` は人間向け alias
 - receiver -> sender feedback status UDP
-- receiver audio callback は SPSC ring 読み取り専用
+- receiver の既定 `ring` path では audio callback は SPSC ring 読み取り専用
 - `JitterBuffer` は renderer / timed output 側が単独所有し、audio callback や UDP receive thread と `Mutex<JitterBuffer>` を共有しない
 - receiver の UDP thread -> renderer queue は満杯時に古いeventを捨て、新しいpacketを残す
 - renderer は output ring 水位と UDP event 到着で起床し、固定sleepによる余分な待ちを抑える
 - receiver audio output は既定の `ring` path に加えて、callback が `JitterBuffer` から直接 pull する `direct` path を選べる
+- receiver `--clock-sync packet` は packet arrival 時刻を基準に、receiver 側 playout 位置を前方へ追いつかせる
 - sender live capture は処理遅れ時に古いcapture chunkを捨て、最新chunkへ追いつく
 - output ring の既定値は `40ms`
 - queue drop / ring underrun / steady underrun などの安定性 metrics
@@ -32,7 +33,7 @@
 未採用の大きな設計案:
 
 - receiver clock master の pull model
-- PTP などによる明示的な network clock sync
+- PTP などによる sender / receiver 間の明示的な絶対時刻 network clock sync
 - Dante / AES67 / RTP / PTP 互換
 - 暗号化、認証、複数送信元、マルチキャスト
 
@@ -74,6 +75,8 @@ capture / sine / wav
   -> CPAL audio callback
   -> output device
 ```
+
+低レイテンシー検証用の `--audio-path direct` では、renderer thread と SPSC output ring を通さず、CPAL audio callback が `JitterBuffer` を直接所有して pull します。これは receiver 側の実装切り替えなので、Windows sender の capture / UDP packet 送信実装はそのまま使います。
 
 ## 必要なもの
 
@@ -543,6 +546,7 @@ mise exec -- cargo run -p receiver -- \
 --output-device <NAME_PART>             audio output device name filter
 --output-file <PATH>                    WAV保存。指定するとwav output扱い
 --audio-path ring|direct                audio output経路。default: ring
+--clock-sync off|packet                 packet arrival基準のreceiver側clock追従。default: off
 --list-devices                          出力デバイス一覧
 --test-tone                             receiver単体でtest tone出力
 --sample-rate <HZ>                      packet sample rate。現在は48000のみ
@@ -656,6 +660,22 @@ audio output では `--output-ring-ms` が固定delay内に収まる必要があ
   --fixed-latency-ms 1
 ```
 
+さらに `--clock-sync packet` を使うと、最初に受け取った packet の sample position と receiver 到着時刻を anchor にして、callback 実行時刻から playout 位置を計算します。これは PTP / NTP のようなホスト間の絶対時刻同期ではなく、receiver 内部で packet arrival clock に追従する仕組みです。
+
+```bash
+./target/release/receiver \
+  --listen 127.0.0.1:50000 \
+  --output audio \
+  --output-device "BlackHole" \
+  --audio-path direct \
+  --clock-sync packet \
+  --output-sample-rate 48000 \
+  --output-buffer-size-frames 64 \
+  --fixed-delay-frames 1
+```
+
+2026-07-08 の localhost 測定では、`sender --input sine --target 127.0.0.1:50000 --packet-ms 1.0` と組み合わせて、`--audio-path direct` は `--fixed-latency-ms 1` まで clean、`--audio-path direct --clock-sync packet` は `--fixed-delay-frames 1` まで receiver 内部 metrics 上 clean でした。ただしこれは `total_buf` で見た receiver 内部 buffered latency です。実際の音として観測される遅延には audio callback period、CoreAudio / device / capture 側の固定遅延が加わります。
+
 ## bit depth と clipping
 
 wire format は 16-bit PCM 固定です。内部処理と resampling は `f32` で行い、送信 packet / WAV 書き出し時に 16-bit へ変換します。
@@ -671,15 +691,14 @@ sample rate: 48000 Hz
 channels: 2
 sample format: signed 16-bit little endian PCM
 default packet duration: 5 ms
-optional packet duration: 2.5 ms
-fixed-delay packet duration: 5 ms
-frames per packet: 240 at 5 ms, 120 at 2.5 ms
-payload bytes per packet: 960 at 5 ms, 480 at 2.5 ms
-nominal packet rate: 200 packets/s at 5 ms, 400 packets/s at 2.5 ms
+optional packet duration: configurable by --packet-ms
+frames per packet: 240 at 5 ms, 120 at 2.5 ms, 48 at 1 ms
+payload bytes per packet: 960 at 5 ms, 480 at 2.5 ms, 192 at 1 ms
+nominal packet rate: 200 packets/s at 5 ms, 400 packets/s at 2.5 ms, 1000 packets/s at 1 ms
 nominal bitrate: 1.536 Mbps + UDP/IP overhead
 ```
 
-5ms / 2.5ms packet はどちらも UDP payload が通常の Ethernet MTU 1500 bytes 未満に収まるようにしています。
+5ms / 2.5ms / 1ms packet はいずれも UDP payload が通常の Ethernet MTU 1500 bytes 未満に収まるようにしています。
 
 ## トラブルシュート
 
