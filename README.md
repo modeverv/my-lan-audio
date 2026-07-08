@@ -24,6 +24,7 @@
 - `JitterBuffer` は renderer / timed output 側が単独所有し、audio callback や UDP receive thread と `Mutex<JitterBuffer>` を共有しない
 - receiver の UDP thread -> renderer queue は満杯時に古いeventを捨て、新しいpacketを残す
 - renderer は output ring 水位と UDP event 到着で起床し、固定sleepによる余分な待ちを抑える
+- receiver audio output は既定の `ring` path に加えて、callback が `JitterBuffer` から直接 pull する `direct` path を選べる
 - sender live capture は処理遅れ時に古いcapture chunkを捨て、最新chunkへ追いつく
 - output ring の既定値は `40ms`
 - queue drop / ring underrun / steady underrun などの安定性 metrics
@@ -541,6 +542,7 @@ mise exec -- cargo run -p receiver -- \
 --output null|audio|wav                 出力先。default: null
 --output-device <NAME_PART>             audio output device name filter
 --output-file <PATH>                    WAV保存。指定するとwav output扱い
+--audio-path ring|direct                audio output経路。default: ring
 --list-devices                          出力デバイス一覧
 --test-tone                             receiver単体でtest tone出力
 --sample-rate <HZ>                      packet sample rate。現在は48000のみ
@@ -548,6 +550,7 @@ mise exec -- cargo run -p receiver -- \
 --fixed-delay-frames <FRAMES>           receiver内部の合算固定 playout delay。default: 14400
 --fixed-latency-ms <MS>                 人間向けalias。48kHz framesへ変換
 --output-buffer-size-frames <FRAMES>    audio backend buffer size固定指定
+--output-sample-rate <HZ>               audio backend sample rate指定。例: 48000
 --output-ring-ms <MS>                   audio callback前のSPSC ring目標量。default: 40
 --output-ring-capacity-ms <MS>          SPSC ring容量。default: 200
 --render-chunk-ms <MS>                  rendererの生成chunk。default: 5
@@ -639,6 +642,19 @@ total_buf / remote_total ~= fixed
 `--fixed-delay-frames 14400` かつ `--output-ring-ms 40` の場合、output ring が約 `1920fr` なら jitter buffer は約 `12480fr` を目標にします。receiver 内部の buffered latency は合算でおおむね `14400fr` です。実際に耳やDAWで観測される遅延には、そこへ backend/device/capture 側の固定遅延が加わります。DAW 側で固定補正する場合は、クリックやパルスで実測して補正値を決めてください。
 
 audio output では `--output-ring-ms` が固定delay内に収まる必要があります。例えば `--fixed-latency-ms 20` を指定する場合、`--output-ring-ms` は 20ms 未満にしてください。
+
+`--audio-path direct` は renderer thread と output ring を通さず、CPAL/CoreAudio callback が `JitterBuffer` から直接 pull します。localhost の低レイテンシー測定では、例えば以下の条件で callback 前 ring の待ちを外せます。
+
+```bash
+./target/release/receiver \
+  --listen 127.0.0.1:50000 \
+  --output audio \
+  --output-device "BlackHole" \
+  --audio-path direct \
+  --output-sample-rate 48000 \
+  --output-buffer-size-frames 64 \
+  --fixed-latency-ms 1
+```
 
 ## bit depth と clipping
 

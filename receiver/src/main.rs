@@ -7,13 +7,13 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24,
 };
+use crossbeam_queue::ArrayQueue;
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use lan_audio_common::audio::{f32_to_i16, CHANNELS, SAMPLE_RATE};
 use lan_audio_common::jitter::{InsertOutcome, JitterBuffer, JitterConfig, JitterMetrics};
 use lan_audio_common::packet::AudioPacket;
 use lan_audio_common::status::ReceiverStatus;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
@@ -44,6 +44,9 @@ struct Args {
     #[arg(long)]
     output_file: Option<PathBuf>,
 
+    #[arg(long, default_value = "ring", value_parser = ["ring", "direct"])]
+    audio_path: String,
+
     #[arg(long)]
     list_devices: bool,
 
@@ -70,6 +73,9 @@ struct Args {
 
     #[arg(long)]
     output_buffer_size_frames: Option<u32>,
+
+    #[arg(long)]
+    output_sample_rate: Option<u32>,
 
     #[arg(long, default_value_t = 40)]
     output_ring_ms: u32,
@@ -203,7 +209,7 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
     if timing.output_ring_capacity_ms < timing.output_ring_ms + timing.render_chunk_ms {
         bail!("--output-ring-capacity-ms must be at least --output-ring-ms + --render-chunk-ms");
     }
-    if output_mode(args) == "audio" {
+    if output_mode(args) == "audio" && args.audio_path == "ring" {
         let output_ring_frames = ms_to_frames(timing.output_ring_ms, args.sample_rate);
         if output_ring_frames > timing.fixed_delay_frames {
             bail!("--output-ring-ms must fit within --fixed-delay-frames / --fixed-latency-ms");
@@ -299,8 +305,8 @@ enum ReceiverEvent {
 }
 
 struct ReceiverEventQueue {
-    capacity: usize,
-    events: Mutex<VecDeque<ReceiverEvent>>,
+    events: ArrayQueue<ReceiverEvent>,
+    ready_lock: Mutex<()>,
     ready: Condvar,
 }
 
@@ -311,42 +317,50 @@ impl ReceiverEventQueue {
             "receiver event queue capacity must be non-zero"
         );
         Self {
-            capacity,
-            events: Mutex::new(VecDeque::with_capacity(capacity)),
+            events: ArrayQueue::new(capacity),
+            ready_lock: Mutex::new(()),
             ready: Condvar::new(),
         }
     }
 
-    fn push_drop_oldest(&self, event: ReceiverEvent) -> bool {
-        let Ok(mut events) = self.events.lock() else {
-            return true;
-        };
-        let dropped_oldest = if events.len() >= self.capacity {
-            events.pop_front();
-            true
-        } else {
-            false
-        };
-        events.push_back(event);
+    fn push_drop_oldest(&self, mut event: ReceiverEvent) -> bool {
+        let mut dropped_oldest = false;
+        loop {
+            match self.events.push(event) {
+                Ok(()) => break,
+                Err(returned) => {
+                    event = returned;
+                    let _ = self.events.pop();
+                    dropped_oldest = true;
+                }
+            }
+        }
         self.ready.notify_one();
         dropped_oldest
     }
 
     fn drain_into(&self, output: &mut Vec<ReceiverEvent>) {
-        let Ok(mut events) = self.events.lock() else {
-            return;
-        };
-        output.extend(events.drain(..));
+        while let Some(event) = self.events.pop() {
+            output.push(event);
+        }
+    }
+
+    fn try_drain_into(&self, output: &mut Vec<ReceiverEvent>) -> bool {
+        self.drain_into(output);
+        true
     }
 
     fn wait_for_event_or_timeout(&self, timeout: Duration) {
-        let Ok(events) = self.events.lock() else {
-            return;
-        };
-        if !events.is_empty() {
+        if !self.events.is_empty() {
             return;
         }
-        let Ok((_events, _timeout)) = self.ready.wait_timeout(events, timeout) else {
+        let Ok(guard) = self.ready_lock.lock() else {
+            return;
+        };
+        if !self.events.is_empty() {
+            return;
+        }
+        let Ok((_guard, _timeout)) = self.ready.wait_timeout(guard, timeout) else {
             return;
         };
     }
@@ -393,7 +407,7 @@ impl IngressMetrics {
     }
 
     fn record_stream_source(&self, outcome: InsertOutcome, stream_id: u64, source: SocketAddr) {
-        let Ok(mut sources) = self.sources.lock() else {
+        let Ok(mut sources) = self.sources.try_lock() else {
             return;
         };
         match outcome {
@@ -529,14 +543,22 @@ fn drain_receiver_events(
 ) {
     event_queue.drain_into(event_scratch);
     for event in event_scratch.drain(..) {
-        match event {
-            ReceiverEvent::Packet(packet, source, arrival) => {
-                let stream_id = packet.header.stream_id;
-                let outcome = jitter.insert_packet(packet, arrival);
-                ingress_metrics.record_stream_source(outcome, stream_id, source);
-            }
-            ReceiverEvent::InvalidPacket => jitter.record_invalid_packet(),
+        process_receiver_event(event, jitter, ingress_metrics);
+    }
+}
+
+fn process_receiver_event(
+    event: ReceiverEvent,
+    jitter: &mut JitterBuffer,
+    ingress_metrics: &IngressMetrics,
+) {
+    match event {
+        ReceiverEvent::Packet(packet, source, arrival) => {
+            let stream_id = packet.header.stream_id;
+            let outcome = jitter.insert_packet(packet, arrival);
+            ingress_metrics.record_stream_source(outcome, stream_id, source);
         }
+        ReceiverEvent::InvalidPacket => jitter.record_invalid_packet(),
     }
 }
 
@@ -620,42 +642,65 @@ fn run_audio_output(
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
+    if let Some(sample_rate) = args.output_sample_rate {
+        config.sample_rate = sample_rate;
+    }
     if let Some(frames) = timing.output_buffer_size_frames {
         config.buffer_size = BufferSize::Fixed(frames);
     }
 
     println!(
-        "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?} buffer={:?}",
-        name, config.sample_rate, config.channels, sample_format, config.buffer_size
+        "receiver: output_device=\"{}\" output_format={}Hz/{}ch/{:?} buffer={:?} audio_path={}",
+        name,
+        config.sample_rate,
+        config.channels,
+        sample_format,
+        config.buffer_size,
+        args.audio_path
     );
 
     let channels = usize::from(config.channels.max(1));
-    let ring_capacity_samples =
-        samples_from_ms(config.sample_rate, channels, timing.output_ring_capacity_ms);
-    let ring = Arc::new(SpscF32Ring::new(ring_capacity_samples));
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
-    spawn_ring_renderer(
-        jitter_config,
-        event_queue,
-        Arc::clone(&ring),
-        Arc::clone(&callback_metrics),
-        Arc::clone(&receiver_state),
-        Arc::clone(&ingress_metrics),
-        RingRendererConfig {
-            output_sample_rate: config.sample_rate,
-            channels,
-            output_ring_ms: timing.output_ring_ms,
-            render_chunk_ms: timing.render_chunk_ms,
-            realtime_priority: true,
-        },
-    );
-    let stream = build_ring_output_stream(
-        &device,
-        sample_format,
-        &config,
-        Arc::clone(&ring),
-        Arc::clone(&callback_metrics),
-    )?;
+    let stream = match args.audio_path.as_str() {
+        "ring" => {
+            let ring_capacity_samples =
+                samples_from_ms(config.sample_rate, channels, timing.output_ring_capacity_ms);
+            let ring = Arc::new(SpscF32Ring::new(ring_capacity_samples));
+            spawn_ring_renderer(
+                jitter_config,
+                event_queue,
+                Arc::clone(&ring),
+                Arc::clone(&callback_metrics),
+                Arc::clone(&receiver_state),
+                Arc::clone(&ingress_metrics),
+                RingRendererConfig {
+                    output_sample_rate: config.sample_rate,
+                    channels,
+                    output_ring_ms: timing.output_ring_ms,
+                    render_chunk_ms: timing.render_chunk_ms,
+                    realtime_priority: true,
+                },
+            );
+            build_ring_output_stream(
+                &device,
+                sample_format,
+                &config,
+                Arc::clone(&ring),
+                Arc::clone(&callback_metrics),
+            )?
+        }
+        "direct" => build_direct_output_stream(
+            &device,
+            sample_format,
+            &config,
+            jitter_config,
+            event_queue,
+            Arc::clone(&callback_metrics),
+            Arc::clone(&receiver_state),
+            Arc::clone(&ingress_metrics),
+        )?,
+        other => bail!("unsupported audio path {other}"),
+    };
     stream.play().context("failed to start output stream")?;
 
     let feedback = FeedbackSender::new(args.feedback_target)?;
@@ -764,6 +809,187 @@ where
                 callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
                 fill_scratch_with_last_frame(&mut scratch[popped..], channels, &last_frame);
             }
+            for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
+                *dst = output_sample(src);
+            }
+        },
+        err_fn,
+        None,
+    )?)
+}
+
+fn build_direct_output_stream(
+    device: &cpal::Device,
+    sample_format: SampleFormat,
+    config: &StreamConfig,
+    jitter_config: JitterConfig,
+    event_queue: Arc<ReceiverEventQueue>,
+    callback_metrics: Arc<OutputCallbackMetrics>,
+    receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
+) -> Result<Stream> {
+    let stream = match sample_format {
+        SampleFormat::I8 => build_direct_output_stream_for::<i8>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::I16 => build_direct_output_stream_for::<i16>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::I24 => build_direct_output_stream_for::<I24>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::I32 => build_direct_output_stream_for::<i32>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::I64 => build_direct_output_stream_for::<i64>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::U8 => build_direct_output_stream_for::<u8>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::U16 => build_direct_output_stream_for::<u16>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::U24 => build_direct_output_stream_for::<U24>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::U32 => build_direct_output_stream_for::<u32>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::U64 => build_direct_output_stream_for::<u64>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::F32 => build_direct_output_stream_for::<f32>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::F64 => build_direct_output_stream_for::<f64>(
+            device,
+            config,
+            jitter_config,
+            event_queue,
+            callback_metrics,
+            receiver_state,
+            ingress_metrics,
+        )?,
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
+            bail!("DSD output sample format {sample_format:?} is not supported")
+        }
+        other => bail!("unsupported output sample format {other:?}"),
+    };
+    Ok(stream)
+}
+
+fn build_direct_output_stream_for<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    jitter_config: JitterConfig,
+    event_queue: Arc<ReceiverEventQueue>,
+    callback_metrics: Arc<OutputCallbackMetrics>,
+    receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
+) -> Result<Stream>
+where
+    T: Sample + SizedSample + FromSample<f32> + Send + 'static,
+{
+    let err_fn = |err| eprintln!("audio output stream error: {err}");
+    let channels = usize::from(config.channels.max(1));
+    let output_sample_rate = config.sample_rate;
+    let mut jitter = JitterBuffer::new(jitter_config);
+    let mut event_scratch = Vec::with_capacity(256);
+    let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
+    let mut last_frame = vec![0.0f32; channels];
+
+    Ok(device.build_output_stream(
+        *config,
+        move |data: &mut [T], _| {
+            callback_metrics.record_callback(data.len() / channels);
+            if data.len() > scratch.len() {
+                callback_metrics.record_scratch_overflow();
+                fill_with_last_frame(data, channels, &last_frame);
+                return;
+            }
+
+            if event_queue.try_drain_into(&mut event_scratch) {
+                for event in event_scratch.drain(..) {
+                    process_receiver_event(event, &mut jitter, &ingress_metrics);
+                }
+            } else {
+                callback_metrics.record_lock_miss();
+            }
+
+            let scratch = &mut scratch[..data.len()];
+            jitter.trim_to_playout_buffer_budget(0);
+            jitter.pull_f32_at_sample_rate_with_playout_buffer(scratch, output_sample_rate, 0);
+            callback_metrics.record_output_queue_samples(0);
+            update_last_frame(scratch, channels, &mut last_frame);
+            receiver_state.publish(&jitter);
+
             for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
                 *dst = output_sample(src);
             }
@@ -1121,6 +1347,10 @@ impl OutputCallbackMetrics {
         self.frames.fetch_add(frames as u64, Ordering::Relaxed);
     }
 
+    fn record_lock_miss(&self) {
+        self.lock_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_scratch_overflow(&self) {
         self.scratch_overflows.fetch_add(1, Ordering::Relaxed);
     }
@@ -1463,6 +1693,7 @@ mod tests {
             output: "null".to_string(),
             output_device: None,
             output_file: None,
+            audio_path: "ring".to_string(),
             list_devices: false,
             test_tone: false,
             sample_rate: SAMPLE_RATE,
@@ -1470,6 +1701,7 @@ mod tests {
             fixed_delay_frames: None,
             fixed_latency_ms: None,
             output_buffer_size_frames: None,
+            output_sample_rate: None,
             output_ring_ms: 40,
             output_ring_capacity_ms: 200,
             render_chunk_ms: 5,
@@ -1538,6 +1770,18 @@ mod tests {
         let timing = ReceiverTiming::from_args(&args).unwrap();
 
         assert!(validate_audio_args(&args, &timing).is_err());
+    }
+
+    #[test]
+    fn direct_audio_path_does_not_require_output_ring_inside_fixed_delay() {
+        let mut args = default_args();
+        args.output = "audio".to_string();
+        args.audio_path = "direct".to_string();
+        args.fixed_latency_ms = Some(1);
+        args.output_ring_ms = 40;
+        let timing = ReceiverTiming::from_args(&args).unwrap();
+
+        validate_audio_args(&args, &timing).unwrap();
     }
 
     #[test]

@@ -8,6 +8,7 @@ version.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.18"
+crossbeam-queue = "0.3"
 hound = "3.5"
 lan-audio-common = { path = "../common" }
 socket2 = "0.5"
