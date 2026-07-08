@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24};
 use lan_audio_common::audio::{f32_to_i16, rms_db, StereoFrame, CHANNELS, SAMPLE_RATE};
@@ -16,6 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP sender")]
 struct Args {
+    #[arg(long, value_enum, default_value = "capture")]
+    input: SenderInput,
+
     #[arg(long, default_value = "127.0.0.1:50000")]
     target: SocketAddr,
 
@@ -43,6 +46,12 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_CAPTURE_SENDER_QUEUE_CAPACITY)]
     capture_queue_capacity: usize,
 
+    #[arg(long, value_enum, default_value = "latest")]
+    capture_queue_mode: CaptureQueueMode,
+
+    #[arg(long, value_enum, default_value = "off")]
+    capture_packet_pacing: CapturePacketPacing,
+
     #[arg(long)]
     duration_sec: Option<f64>,
 
@@ -60,6 +69,45 @@ struct Args {
 
     #[arg(long, default_value_t = 1.0)]
     metrics_interval_sec: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SenderInput {
+    Capture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CaptureQueueMode {
+    Latest,
+    Fifo,
+}
+
+impl CaptureQueueMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Fifo => "fifo",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CapturePacketPacing {
+    Off,
+    On,
+}
+
+impl CapturePacketPacing {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self == Self::On
+    }
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +131,7 @@ struct CaptureQueueSnapshot {
 
 struct CaptureQueue {
     capacity: usize,
+    mode: CaptureQueueMode,
     chunks: Mutex<VecDeque<Vec<StereoFrame>>>,
     ready: Condvar,
     dropped_chunks: AtomicU64,
@@ -91,10 +140,11 @@ struct CaptureQueue {
 }
 
 impl CaptureQueue {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, mode: CaptureQueueMode) -> Self {
         assert!(capacity > 0, "capture queue capacity must be non-zero");
         Self {
             capacity,
+            mode,
             chunks: Mutex::new(VecDeque::with_capacity(capacity)),
             ready: Condvar::new(),
             dropped_chunks: AtomicU64::new(0),
@@ -110,9 +160,19 @@ impl CaptureQueue {
             return;
         };
 
-        while chunks.len() >= self.capacity {
-            if let Some(old) = chunks.pop_front() {
-                self.record_dropped_chunk_len(old.len());
+        if chunks.len() >= self.capacity {
+            match self.mode {
+                CaptureQueueMode::Latest => {
+                    while chunks.len() >= self.capacity {
+                        if let Some(old) = chunks.pop_front() {
+                            self.record_dropped_chunk_len(old.len());
+                        }
+                    }
+                }
+                CaptureQueueMode::Fifo => {
+                    self.record_dropped_chunk_len(chunk.len());
+                    return;
+                }
             }
         }
         chunks.push_back(chunk);
@@ -372,7 +432,9 @@ fn main() -> Result<()> {
     }
 
     let remote_status = spawn_feedback_listener(args.feedback_listen)?;
-    run_capture_sender(&args, remote_status)
+    match args.input {
+        SenderInput::Capture => run_capture_sender(&args, remote_status),
+    }
 }
 
 fn validate_audio_args(args: &Args) -> Result<()> {
@@ -462,10 +524,12 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
     stream.play().context("failed to start input stream")?;
 
     println!(
-        "capture_started=true target={} source_rate={} capture_queue_capacity={} capture_queue_mode=fifo capture_packet_pacing=on",
+        "capture_started=true target={} source_rate={} capture_queue_capacity={} capture_queue_mode={} capture_packet_pacing={}",
         args.target,
         source_rate,
-        args.capture_queue_capacity
+        args.capture_queue_capacity,
+        args.capture_queue_mode.as_str(),
+        args.capture_packet_pacing.as_str()
     );
     let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
     let mut sender = PacketSender::new(args)?;
@@ -489,40 +553,59 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
         let interval = packet_interval(args, send_rate_ppm);
         let now = Instant::now();
         if pending.len() >= packet_frames {
-            let max_lag = interval.mul_f64(CAPTURE_PACING_MAX_CATCH_UP_PACKETS as f64);
-            if now.saturating_duration_since(next_packet_deadline) > max_lag {
-                let keep_frames = packet_frames * CAPTURE_PACING_MAX_CATCH_UP_PACKETS;
-                if pending.len() > keep_frames {
-                    pending.drain(..pending.len() - keep_frames);
+            if args.capture_packet_pacing.enabled() {
+                let max_lag = interval.mul_f64(CAPTURE_PACING_MAX_CATCH_UP_PACKETS as f64);
+                if now.saturating_duration_since(next_packet_deadline) > max_lag {
+                    let keep_frames = packet_frames * CAPTURE_PACING_MAX_CATCH_UP_PACKETS;
+                    if pending.len() > keep_frames {
+                        pending.drain(..pending.len() - keep_frames);
+                    }
+                    next_packet_deadline = now;
                 }
-                next_packet_deadline = now;
-            }
 
-            let mut sent_packets = 0usize;
-            while pending.len() >= packet_frames && Instant::now() >= next_packet_deadline {
-                sender.send_frames(&pending[..packet_frames])?;
-                pending.drain(..packet_frames);
-                next_packet_deadline += interval;
-                sent_packets += 1;
-                if sent_packets >= CAPTURE_PACING_MAX_CATCH_UP_PACKETS {
-                    break;
+                let mut sent_packets = 0usize;
+                while pending.len() >= packet_frames && Instant::now() >= next_packet_deadline {
+                    sender.send_frames(&pending[..packet_frames])?;
+                    pending.drain(..packet_frames);
+                    next_packet_deadline += interval;
+                    sent_packets += 1;
+                    if sent_packets >= CAPTURE_PACING_MAX_CATCH_UP_PACKETS {
+                        break;
+                    }
                 }
-            }
 
-            if sent_packets > 0 {
-                let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-                metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
-                continue;
+                if sent_packets > 0 {
+                    let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
+                    metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+                    continue;
+                }
+            } else {
+                let mut sent_packets = 0usize;
+                while pending.len() >= packet_frames {
+                    sender.send_frames(&pending[..packet_frames])?;
+                    pending.drain(..packet_frames);
+                    sent_packets += 1;
+                    if sent_packets >= CAPTURE_PACING_MAX_CATCH_UP_PACKETS {
+                        break;
+                    }
+                }
+
+                if sent_packets > 0 {
+                    let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
+                    metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+                    continue;
+                }
             }
         }
 
-        let capture_timeout = if pending.len() >= packet_frames {
-            next_packet_deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100))
-        } else {
-            Duration::from_millis(100)
-        };
+        let capture_timeout =
+            if args.capture_packet_pacing.enabled() && pending.len() >= packet_frames {
+                next_packet_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100))
+            } else {
+                Duration::from_millis(100)
+            };
         let captured = capture_queue.recv_timeout(capture_timeout);
 
         if let Some(chunk) = captured {
@@ -553,7 +636,7 @@ fn open_capture_stream(
     let config = supported.config();
     let source_rate = config.sample_rate;
     let source_channels = config.channels as usize;
-    let capture_queue = Arc::new(CaptureQueue::new(queue_capacity));
+    let capture_queue = Arc::new(CaptureQueue::new(queue_capacity, args.capture_queue_mode));
 
     println!(
         "selected_device=\"{}\" input_format={}Hz/{}ch/{:?}",
@@ -730,8 +813,8 @@ mod tests {
     }
 
     #[test]
-    fn capture_queue_push_drops_oldest_when_full() {
-        let queue = CaptureQueue::new(2);
+    fn latest_capture_queue_drops_oldest_when_full() {
+        let queue = CaptureQueue::new(2, CaptureQueueMode::Latest);
 
         queue.push_realtime(chunk(1.0, 10));
         queue.push_realtime(chunk(2.0, 20));
@@ -747,7 +830,7 @@ mod tests {
 
     #[test]
     fn capture_queue_fifo_recv_preserves_backlog() {
-        let queue = CaptureQueue::new(4);
+        let queue = CaptureQueue::new(4, CaptureQueueMode::Fifo);
 
         queue.push_realtime(chunk(1.0, 10));
         queue.push_realtime(chunk(2.0, 20));
@@ -764,5 +847,25 @@ mod tests {
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.dropped_chunks, 0);
         assert_eq!(snapshot.dropped_frames, 0);
+    }
+
+    #[test]
+    fn fifo_capture_queue_drops_newest_when_full() {
+        let queue = CaptureQueue::new(2, CaptureQueueMode::Fifo);
+
+        queue.push_realtime(chunk(1.0, 10));
+        queue.push_realtime(chunk(2.0, 20));
+        queue.push_realtime(chunk(3.0, 30));
+
+        let first = queue.recv_timeout(Duration::from_millis(0)).unwrap();
+        let second = queue.recv_timeout(Duration::from_millis(0)).unwrap();
+
+        assert_eq!(first[0].left, 1.0);
+        assert_eq!(second[0].left, 2.0);
+        assert!(queue.recv_timeout(Duration::from_millis(0)).is_none());
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.dropped_chunks, 1);
+        assert_eq!(snapshot.dropped_frames, 30);
     }
 }
