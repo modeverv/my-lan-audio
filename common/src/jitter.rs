@@ -3,6 +3,8 @@ use crate::packet::AudioPacket;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+const STREAM_SWITCH_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Debug)]
 pub struct JitterConfig {
     pub sample_rate: u32,
@@ -42,6 +44,7 @@ pub struct JitterMetrics {
     pub out_of_order_packets: u64,
     pub late_packets: u64,
     pub invalid_packets: u64,
+    pub foreign_stream_packets: u64,
     pub output_underruns: u64,
     pub startup_underruns: u64,
     pub steady_underruns: u64,
@@ -74,6 +77,7 @@ impl Default for JitterMetrics {
             out_of_order_packets: 0,
             late_packets: 0,
             invalid_packets: 0,
+            foreign_stream_packets: 0,
             output_underruns: 0,
             startup_underruns: 0,
             steady_underruns: 0,
@@ -101,6 +105,7 @@ impl Default for JitterMetrics {
 pub enum InsertOutcome {
     Accepted,
     Duplicate,
+    ForeignStream,
     Late,
     Resynced,
 }
@@ -130,6 +135,7 @@ pub struct JitterBuffer {
     first_drift_arrival: Option<Instant>,
     fixed_anchor_sample: Option<u64>,
     fixed_anchor_playout_at: Option<Instant>,
+    last_stream_arrival: Option<Instant>,
     consecutive_missing_frames: u64,
     metrics: JitterMetrics,
 }
@@ -148,6 +154,7 @@ impl JitterBuffer {
             first_drift_arrival: None,
             fixed_anchor_sample: None,
             fixed_anchor_playout_at: None,
+            last_stream_arrival: None,
             consecutive_missing_frames: 0,
             metrics: JitterMetrics::default(),
         }
@@ -164,11 +171,19 @@ impl JitterBuffer {
         }
 
         let mut outcome = InsertOutcome::Accepted;
-        if self.stream_id != Some(packet.header.stream_id) {
-            if self.stream_id.is_some() {
+        if let Some(stream_id) = self.stream_id {
+            if stream_id != packet.header.stream_id {
+                if self.current_stream_is_active(arrival) {
+                    self.metrics.foreign_stream_packets += 1;
+                    self.refresh_metrics();
+                    return InsertOutcome::ForeignStream;
+                }
                 self.clear_for_resync(ResyncReason::StreamChange);
                 outcome = InsertOutcome::Resynced;
             }
+        }
+
+        if self.stream_id != Some(packet.header.stream_id) {
             self.stream_id = Some(packet.header.stream_id);
             self.read_pos = packet.header.sample_position as f64;
             self.set_fixed_schedule(packet.header.sample_position, arrival);
@@ -206,6 +221,7 @@ impl JitterBuffer {
         self.metrics.accepted_packets += 1;
         self.metrics.latest_sequence = Some(packet.header.sequence);
         self.metrics.latest_sample_position = Some(start);
+        self.last_stream_arrival = Some(arrival);
         self.update_drift_estimate(start, arrival);
         self.drop_over_capacity();
         self.refresh_metrics();
@@ -427,6 +443,13 @@ impl JitterBuffer {
         );
     }
 
+    fn current_stream_is_active(&self, arrival: Instant) -> bool {
+        self.last_stream_arrival
+            .and_then(|last| arrival.checked_duration_since(last))
+            .map(|elapsed| elapsed < STREAM_SWITCH_TIMEOUT)
+            .unwrap_or(false)
+    }
+
     fn set_resample_metrics(&mut self, device_resample_ratio: f32) {
         self.metrics.device_resample_ratio = device_resample_ratio;
         self.metrics.effective_resample_ratio = device_resample_ratio;
@@ -478,6 +501,7 @@ impl JitterBuffer {
         self.first_drift_arrival = None;
         self.fixed_anchor_sample = None;
         self.fixed_anchor_playout_at = None;
+        self.last_stream_arrival = None;
         self.consecutive_missing_frames = 0;
         self.state = JitterState::Resync;
         self.metrics.resyncs += 1;
@@ -675,12 +699,16 @@ mod tests {
     #[test]
     fn reports_stream_change_resync_reason() {
         let mut buffer = JitterBuffer::new(JitterConfig::default());
+        let t0 = Instant::now();
         assert_eq!(
-            buffer.insert_packet(packet_for_stream(1, 0, 0), Instant::now()),
+            buffer.insert_packet(packet_for_stream(1, 0, 0), t0),
             InsertOutcome::Accepted
         );
         assert_eq!(
-            buffer.insert_packet(packet_for_stream(2, 0, 0), Instant::now()),
+            buffer.insert_packet(
+                packet_for_stream(2, 0, 0),
+                t0 + STREAM_SWITCH_TIMEOUT + Duration::from_millis(1),
+            ),
             InsertOutcome::Resynced
         );
 
@@ -688,6 +716,26 @@ mod tests {
         assert_eq!(metrics.resyncs, 1);
         assert_eq!(metrics.resyncs_by_stream_change, 1);
         assert_eq!(metrics.resyncs_by_underrun, 0);
+    }
+
+    #[test]
+    fn ignores_foreign_stream_while_current_stream_is_active() {
+        let mut buffer = JitterBuffer::new(JitterConfig::default());
+        let t0 = Instant::now();
+        assert_eq!(
+            buffer.insert_packet(packet_for_stream(1, 0, 0), t0),
+            InsertOutcome::Accepted
+        );
+        assert_eq!(
+            buffer.insert_packet(packet_for_stream(2, 0, 0), t0 + Duration::from_millis(10)),
+            InsertOutcome::ForeignStream
+        );
+
+        let metrics = buffer.metrics();
+        assert_eq!(metrics.stream_id, Some(1));
+        assert_eq!(metrics.foreign_stream_packets, 1);
+        assert_eq!(metrics.resyncs, 0);
+        assert_eq!(metrics.resyncs_by_stream_change, 0);
     }
 
     #[test]

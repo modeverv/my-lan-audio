@@ -9,7 +9,7 @@ use cpal::{
 };
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use lan_audio_common::audio::{f32_to_i16, CHANNELS, SAMPLE_RATE};
-use lan_audio_common::jitter::{JitterBuffer, JitterConfig, JitterMetrics};
+use lan_audio_common::jitter::{InsertOutcome, JitterBuffer, JitterConfig, JitterMetrics};
 use lan_audio_common::packet::AudioPacket;
 use lan_audio_common::status::ReceiverStatus;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -284,7 +284,7 @@ fn bind_socket(addr: SocketAddr, recv_buffer_bytes: usize) -> Result<UdpSocket> 
 }
 
 enum ReceiverEvent {
-    Packet(AudioPacket, Instant),
+    Packet(AudioPacket, SocketAddr, Instant),
     InvalidPacket,
 }
 
@@ -293,6 +293,7 @@ struct IngressMetrics {
     queued_packets: AtomicU64,
     queued_invalid_packets: AtomicU64,
     queue_drops: AtomicU64,
+    sources: Mutex<IngressSources>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -300,6 +301,18 @@ struct IngressSnapshot {
     queued_packets: u64,
     queued_invalid_packets: u64,
     queue_drops: u64,
+    active_stream_id: Option<u64>,
+    active_source: Option<SocketAddr>,
+    foreign_stream_id: Option<u64>,
+    foreign_source: Option<SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IngressSources {
+    active_stream_id: Option<u64>,
+    active_source: Option<SocketAddr>,
+    foreign_stream_id: Option<u64>,
+    foreign_source: Option<SocketAddr>,
 }
 
 impl IngressMetrics {
@@ -315,11 +328,42 @@ impl IngressMetrics {
         self.queue_drops.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_stream_source(&self, outcome: InsertOutcome, stream_id: u64, source: SocketAddr) {
+        let Ok(mut sources) = self.sources.lock() else {
+            return;
+        };
+        match outcome {
+            InsertOutcome::ForeignStream => {
+                sources.foreign_stream_id = Some(stream_id);
+                sources.foreign_source = Some(source);
+            }
+            InsertOutcome::Accepted | InsertOutcome::Duplicate | InsertOutcome::Late => {
+                sources.active_stream_id = Some(stream_id);
+                sources.active_source = Some(source);
+            }
+            InsertOutcome::Resynced => {
+                sources.active_stream_id = Some(stream_id);
+                sources.active_source = Some(source);
+                sources.foreign_stream_id = None;
+                sources.foreign_source = None;
+            }
+        }
+    }
+
     fn snapshot(&self) -> IngressSnapshot {
+        let sources = self
+            .sources
+            .lock()
+            .map(|sources| *sources)
+            .unwrap_or_default();
         IngressSnapshot {
             queued_packets: self.queued_packets.load(Ordering::Relaxed),
             queued_invalid_packets: self.queued_invalid_packets.load(Ordering::Relaxed),
             queue_drops: self.queue_drops.load(Ordering::Relaxed),
+            active_stream_id: sources.active_stream_id,
+            active_source: sources.active_source,
+            foreign_stream_id: sources.foreign_stream_id,
+            foreign_source: sources.foreign_source,
         }
     }
 }
@@ -369,13 +413,13 @@ fn spawn_udp_receiver(
         let mut buf = vec![0u8; 2048];
         loop {
             match socket.recv_from(&mut buf) {
-                Ok((len, _addr)) => {
+                Ok((len, source)) => {
                     let arrival = Instant::now();
                     match AudioPacket::from_bytes(&buf[..len]) {
                         Ok(packet) => {
                             send_receiver_event(
                                 &event_tx,
-                                ReceiverEvent::Packet(packet, arrival),
+                                ReceiverEvent::Packet(packet, source, arrival),
                                 &ingress_metrics,
                                 false,
                             );
@@ -416,11 +460,17 @@ fn send_receiver_event(
     }
 }
 
-fn drain_receiver_events(event_rx: &Receiver<ReceiverEvent>, jitter: &mut JitterBuffer) {
+fn drain_receiver_events(
+    event_rx: &Receiver<ReceiverEvent>,
+    jitter: &mut JitterBuffer,
+    ingress_metrics: &IngressMetrics,
+) {
     while let Ok(event) = event_rx.try_recv() {
         match event {
-            ReceiverEvent::Packet(packet, arrival) => {
-                jitter.insert_packet(packet, arrival);
+            ReceiverEvent::Packet(packet, source, arrival) => {
+                let stream_id = packet.header.stream_id;
+                let outcome = jitter.insert_packet(packet, arrival);
+                ingress_metrics.record_stream_source(outcome, stream_id, source);
             }
             ReceiverEvent::InvalidPacket => jitter.record_invalid_packet(),
         }
@@ -468,7 +518,7 @@ fn run_timed_pull_output(
             return Ok(());
         }
 
-        drain_receiver_events(&event_rx, &mut jitter);
+        drain_receiver_events(&event_rx, &mut jitter, &ingress_metrics);
         jitter.pull_f32_at_sample_rate_for_playout(&mut output, args.sample_rate, next_tick);
         receiver_state.publish(&jitter);
 
@@ -521,6 +571,7 @@ fn run_audio_output(
         Arc::clone(&ring),
         Arc::clone(&callback_metrics),
         Arc::clone(&receiver_state),
+        Arc::clone(&ingress_metrics),
         RingRendererConfig {
             output_sample_rate: config.sample_rate,
             channels,
@@ -668,6 +719,7 @@ fn spawn_ring_renderer(
     ring: Arc<SpscF32Ring>,
     metrics: Arc<OutputCallbackMetrics>,
     receiver_state: Arc<ReceiverState>,
+    ingress_metrics: Arc<IngressMetrics>,
     config: RingRendererConfig,
 ) {
     let spawn_result = thread::Builder::new()
@@ -691,7 +743,7 @@ fn spawn_ring_renderer(
             );
 
             loop {
-                drain_receiver_events(&event_rx, &mut jitter);
+                drain_receiver_events(&event_rx, &mut jitter, &ingress_metrics);
                 loop {
                     let queued = ring.len_samples();
                     metrics.record_output_queue_samples(queued);
@@ -1127,8 +1179,12 @@ impl MetricsPrinter {
         let total_buffered_ms = frames_to_ms_f64(total_buffered_frames, SAMPLE_RATE);
         let fixed_delay_frames = metrics.fixed_delay_frames;
         let fixed_delay_ms = frames_to_ms_f64(fixed_delay_frames, SAMPLE_RATE);
+        let active_source = format_source(ingress.active_source);
+        let active_stream = format_stream_id(ingress.active_stream_id);
+        let foreign_source = format_source(ingress.foreign_source);
+        let foreign_stream = format_stream_id(ingress.foreign_stream_id);
         println!(
-            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s foreign={:.1}/s src={} stream={} foreign_src={} foreign_stream={} buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             queued_packet_delta as f64 / elapsed,
@@ -1138,6 +1194,11 @@ impl MetricsPrinter {
             (metrics.late_packets - previous.late_packets) as f64 / elapsed,
             (metrics.duplicate_packets - previous.duplicate_packets) as f64 / elapsed,
             (metrics.out_of_order_packets - previous.out_of_order_packets) as f64 / elapsed,
+            (metrics.foreign_stream_packets - previous.foreign_stream_packets) as f64 / elapsed,
+            active_source,
+            active_stream,
+            foreign_source,
+            foreign_stream,
             metrics.buffer_level_frames,
             metrics.audio_latency_ms,
             fixed_delay_frames,
@@ -1205,6 +1266,18 @@ fn unix_time_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+fn format_source(source: Option<SocketAddr>) -> String {
+    source
+        .map(|source| source.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_stream_id(stream_id: Option<u64>) -> String {
+    stream_id
+        .map(|stream_id| format!("{stream_id:016x}"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn select_output_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::Device> {
