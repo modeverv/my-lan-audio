@@ -367,32 +367,30 @@ remote_output_rate
 
 ## Practical Tuning For Current Code
 
-現行構造のまま試すなら:
+現行構造で試すなら、receiver は固定 delay frames を主軸にする:
 
 ```bash
 mise exec -- cargo run -p receiver -- \
   --listen 127.0.0.1:50000 \
   --output audio \
   --output-device "MacBook Proのスピーカー" \
-  --target-buffer-ms 120 \
-  --max-buffer-ms 240 \
-  --start-threshold-ms 120 \
-  --max-ppm 1000 \
-  --emergency-max-ppm 5000
+  --fixed-delay-frames 14400 \
+  --output-ring-ms 60 \
+  --output-ring-capacity-ms 160 \
+  --render-chunk-ms 2
 ```
 
-低遅延を試すなら:
+frames を変えて短めに試すなら:
 
 ```bash
 mise exec -- cargo run -p receiver -- \
   --listen 127.0.0.1:50000 \
   --output audio \
   --output-device "MacBook Proのスピーカー" \
-  --target-buffer-ms 60 \
-  --max-buffer-ms 140 \
-  --start-threshold-ms 80 \
-  --max-ppm 1000 \
-  --emergency-max-ppm 5000
+  --fixed-delay-frames 9600 \
+  --output-ring-ms 40 \
+  --output-ring-capacity-ms 120 \
+  --render-chunk-ms 2
 ```
 
 ただし、これは根本解決ではない。根本的には callback 経路をRT安全にする必要がある。

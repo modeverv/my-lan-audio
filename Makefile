@@ -8,13 +8,13 @@ W_AUDIO_ADDR ?= 192.168.11.65:50000
 W_FEEDBACK_ADDR ?= 0.0.0.0:50001
 
 #RECEIVER_OUTPUT_DEVICE ?= MacBook Proのスピーカー
-RECEIVER_OUTPUT_DEVICE ?= BlackHole 2ch
+#RECEIVER_OUTPUT_DEVICE ?= BlackHole 2ch
+RECEIVER_OUTPUT_DEVICE ?= SOUNDPEATS Space
+
 SENDER_INPUT_DEVICE ?= BlackHole 2ch
 
-RECEIVER_LATENCY_MODE ?= fixed-200ms
-TARGET_BUFFER_MS ?= 200
-START_THRESHOLD_MS ?= 200
-MAX_BUFFER_MS ?= 250
+FIXED_DELAY_FRAMES ?= 14400
+FIXED_LATENCY_MS ?=
 
 OUTPUT_RING_MS ?= 60
 OUTPUT_RING_CAPACITY_MS ?= 160
@@ -23,17 +23,27 @@ OUTPUT_BUFFER_SIZE_FRAMES ?= 256
 PACKET_MS ?= 5
 METRICS_INTERVAL_SEC ?= 1
 
+FIXED_DELAY_ARGS :=
+ifneq ($(strip $(FIXED_DELAY_FRAMES)),)
+FIXED_DELAY_ARGS := --fixed-delay-frames $(FIXED_DELAY_FRAMES)
+endif
+ifeq ($(strip $(FIXED_DELAY_ARGS)),)
+ifneq ($(strip $(FIXED_LATENCY_MS)),)
+FIXED_DELAY_ARGS := --fixed-latency-ms $(FIXED_LATENCY_MS)
+endif
+endif
+
 help:
 	@printf '%s\n' 'Targets:'
-	@printf '%s\n' '  make receiver          Start receiver with fixed 200ms latency settings'
+	@printf '%s\n' '  make receiver          Start fixed-buffer receiver'
 	@printf '%s\n' '  make receive           Alias for make receiver'
 	@printf '%s\n' '  make sender            Start capture sender with feedback enabled'
-	@printf '%s\n' '  make fixed-receiver    Start receiver with explicit fixed 200ms latency settings'
-	@printf '%s\n' '  make fixed-sender      Start sender with explicit fixed 200ms mode packet settings'
+	@printf '%s\n' '  make fixed-receiver    Start receiver with explicit fixed-buffer settings'
+	@printf '%s\n' '  make fixed-sender      Start sender with fixed-buffer packet settings'
 	@printf '%s\n' '  make p-receiver        Start release receiver with feedback enabled'
 	@printf '%s\n' '  make p-sender          Start release sender with feedback enabled'
-	@printf '%s\n' '  make p-fixed-receiver  Start release receiver with explicit fixed 200ms latency settings'
-	@printf '%s\n' '  make p-fixed-sender    Start release sender with explicit fixed 200ms mode packet settings'
+	@printf '%s\n' '  make p-fixed-receiver  Start release receiver with explicit fixed-buffer settings'
+	@printf '%s\n' '  make p-fixed-sender    Start release sender with fixed-buffer packet settings'
 	@printf '%s\n' '  make release           Build release binaries'
 	@printf '%s\n' '  make receiver-devices  List receiver output devices'
 	@printf '%s\n' '  make sender-devices    List sender input devices'
@@ -44,23 +54,17 @@ help:
 	@printf '%s\n' 'Common overrides:'
 	@printf '%s\n' '  RECEIVER_OUTPUT_DEVICE="SOUNDPEATS Space"'
 	@printf '%s\n' '  SENDER_INPUT_DEVICE="BlackHole"'
-	@printf '%s\n' '  RECEIVER_LATENCY_MODE=low TARGET_BUFFER_MS=20 OUTPUT_RING_MS=15 PACKET_MS=2.5'
+	@printf '%s\n' '  FIXED_DELAY_FRAMES=14400'
+	@printf '%s\n' '  FIXED_DELAY_FRAMES= FIXED_LATENCY_MS=300'
 
 receiver:
 	mise exec -- cargo run -p receiver -- \
 	  --listen $(AUDIO_ADDR) \
 	  --feedback-target $(FEEDBACK_ADDR) \
-	  --latency-mode $(RECEIVER_LATENCY_MODE) \
-	  --low-latency-trim-margin-ms 10 \
-	  --low-latency-trim-to-margin-ms 10 \
-	  --trim-crossfade-ms 1.5 \
-	  --realtime-renderer \
+	  $(FIXED_DELAY_ARGS) \
 	  --output audio \
 	  --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
 	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
-	  --target-buffer-ms $(TARGET_BUFFER_MS) \
-	  --start-threshold-ms $(START_THRESHOLD_MS) \
-	  --max-buffer-ms $(MAX_BUFFER_MS) \
 	  --output-ring-ms $(OUTPUT_RING_MS) \
 	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
 	  --render-chunk-ms $(RENDER_CHUNK_MS) \
@@ -68,10 +72,7 @@ receiver:
 
 receive: receiver
 
-fixed-receiver: RECEIVER_LATENCY_MODE := fixed-200ms
-fixed-receiver: TARGET_BUFFER_MS := 200
-fixed-receiver: START_THRESHOLD_MS := 200
-fixed-receiver: MAX_BUFFER_MS := 250
+fixed-receiver: FIXED_DELAY_FRAMES := 14400
 fixed-receiver: OUTPUT_RING_MS := 60
 fixed-receiver: OUTPUT_RING_CAPACITY_MS := 160
 fixed-receiver: RENDER_CHUNK_MS := 2
@@ -97,26 +98,16 @@ p-receiver:
 	target/release/receiver \
 	  --listen $(AUDIO_ADDR) \
 	  --feedback-target $(FEEDBACK_ADDR) \
-	  --latency-mode $(RECEIVER_LATENCY_MODE) \
-	  --low-latency-trim-margin-ms 10 \
-	  --low-latency-trim-to-margin-ms 10 \
-	  --trim-crossfade-ms 1.5 \
-	  --realtime-renderer \
+	  $(FIXED_DELAY_ARGS) \
 	  --output audio \
 	  --output-device "$(RECEIVER_OUTPUT_DEVICE)" \
 	  --output-buffer-size-frames $(OUTPUT_BUFFER_SIZE_FRAMES) \
-	  --target-buffer-ms $(TARGET_BUFFER_MS) \
-	  --start-threshold-ms $(START_THRESHOLD_MS) \
-	  --max-buffer-ms $(MAX_BUFFER_MS) \
 	  --output-ring-ms $(OUTPUT_RING_MS) \
 	  --output-ring-capacity-ms $(OUTPUT_RING_CAPACITY_MS) \
 	  --render-chunk-ms $(RENDER_CHUNK_MS) \
 	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
-p-fixed-receiver: RECEIVER_LATENCY_MODE := fixed-200ms
-p-fixed-receiver: TARGET_BUFFER_MS := 200
-p-fixed-receiver: START_THRESHOLD_MS := 200
-p-fixed-receiver: MAX_BUFFER_MS := 250
+p-fixed-receiver: FIXED_DELAY_FRAMES := 14400
 p-fixed-receiver: OUTPUT_RING_MS := 60
 p-fixed-receiver: OUTPUT_RING_CAPACITY_MS := 160
 p-fixed-receiver: RENDER_CHUNK_MS := 2

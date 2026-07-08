@@ -2,7 +2,7 @@ mod audio_ring;
 
 use anyhow::{anyhow, bail, Context, Result};
 use audio_ring::SpscF32Ring;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24,
@@ -23,32 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const FIXED_LATENCY_MS: u32 = 200;
-const FIXED_LATENCY_MAX_BUFFER_MS: u32 = 250;
-const FIXED_LATENCY_CAPACITY_MS: u32 = 600;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum LatencyMode {
-    Normal,
-    Low,
-    #[value(
-        name = "fixed-200ms",
-        alias = "fixed200",
-        alias = "fixed-500ms",
-        alias = "fixed500"
-    )]
-    Fixed200Ms,
-}
-
-impl LatencyMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Low => "low",
-            Self::Fixed200Ms => "fixed-200ms",
-        }
-    }
-}
+const DEFAULT_FIXED_DELAY_FRAMES: u64 = 14_400;
+const FIXED_LATENCY_MIN_CAPACITY_MS: u32 = 600;
 
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP receiver")]
@@ -80,61 +56,17 @@ struct Args {
     #[arg(long, default_value_t = CHANNELS)]
     channels: u16,
 
-    #[arg(long, default_value_t = 1000)]
-    capacity_ms: u32,
-
-    #[arg(long, default_value_t = 100)]
-    target_buffer_ms: u32,
-
-    #[arg(long, default_value_t = 300)]
-    max_buffer_ms: u32,
-
-    #[arg(long, default_value_t = 100)]
-    start_threshold_ms: u32,
-
-    #[arg(long, default_value_t = 5.0)]
-    kp: f32,
-
-    #[arg(long, default_value_t = 0.2)]
-    ki: f32,
-
-    #[arg(long, default_value_t = 0.05)]
-    error_filter_alpha: f32,
-
-    #[arg(long, default_value_t = 1000.0)]
-    integral_limit_ms_sec: f32,
-
-    #[arg(long, default_value_t = 1000.0)]
-    max_ppm: f32,
-
-    #[arg(long, default_value_t = 5000.0)]
-    emergency_max_ppm: f32,
-
-    #[arg(long)]
-    no_adaptive_resampling: bool,
+    #[arg(
+        long,
+        help = "Enable fixed-delay playout scheduling with the given 48k source frame delay"
+    )]
+    fixed_delay_frames: Option<u64>,
 
     #[arg(
         long,
-        value_enum,
-        default_value = "normal",
-        help = "Receiver latency profile"
+        help = "Human-friendly alias for --fixed-delay-frames, converted using the packet sample rate"
     )]
-    latency_mode: LatencyMode,
-
-    #[arg(long, help = "Alias for --latency-mode low")]
-    low_latency: bool,
-
-    #[arg(long, default_value_t = 10)]
-    low_latency_trim_margin_ms: u32,
-
-    #[arg(long, default_value_t = 10)]
-    low_latency_trim_to_margin_ms: u32,
-
-    #[arg(long, default_value_t = 1.5)]
-    trim_crossfade_ms: f32,
-
-    #[arg(long)]
-    realtime_renderer: bool,
+    fixed_latency_ms: Option<u32>,
 
     #[arg(long)]
     output_buffer_size_frames: Option<u32>,
@@ -182,83 +114,68 @@ fn main() -> Result<()> {
 
 #[derive(Clone, Copy, Debug)]
 struct ReceiverTiming {
-    latency_mode: LatencyMode,
     capacity_ms: u32,
     target_buffer_ms: u32,
-    max_buffer_ms: u32,
-    start_threshold_ms: u32,
-    low_latency: bool,
-    low_latency_trim_margin_ms: u32,
-    low_latency_trim_to_margin_ms: u32,
+    fixed_delay_frames: u64,
     output_ring_ms: u32,
     output_ring_capacity_ms: u32,
     render_chunk_ms: u32,
-    realtime_renderer: bool,
     output_buffer_size_frames: Option<u32>,
 }
 
 impl ReceiverTiming {
     fn from_args(args: &Args) -> Result<Self> {
-        if args.low_latency && args.latency_mode != LatencyMode::Normal {
-            bail!("--low-latency cannot be combined with --latency-mode");
+        if args.fixed_delay_frames.is_some() && args.fixed_latency_ms.is_some() {
+            bail!("--fixed-delay-frames and --fixed-latency-ms cannot be combined");
         }
 
-        let latency_mode = if args.low_latency {
-            LatencyMode::Low
-        } else {
-            args.latency_mode
-        };
+        let fixed_delay_frames = args
+            .fixed_delay_frames
+            .or_else(|| {
+                args.fixed_latency_ms
+                    .map(|ms| ms_to_frames(ms, args.sample_rate))
+            })
+            .unwrap_or(DEFAULT_FIXED_DELAY_FRAMES);
+        let fixed_delay_ms = frames_to_ms_ceil(fixed_delay_frames, args.sample_rate);
 
-        let timing = match latency_mode {
-            LatencyMode::Normal => Self {
-                latency_mode,
-                capacity_ms: args.capacity_ms,
-                target_buffer_ms: args.target_buffer_ms,
-                max_buffer_ms: args.max_buffer_ms,
-                start_threshold_ms: args.start_threshold_ms,
-                low_latency: false,
-                low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
-                low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
-                output_ring_ms: args.output_ring_ms,
-                output_ring_capacity_ms: args.output_ring_capacity_ms,
-                render_chunk_ms: args.render_chunk_ms,
-                realtime_renderer: args.realtime_renderer,
-                output_buffer_size_frames: args.output_buffer_size_frames,
-            },
-            LatencyMode::Low => Self {
-                latency_mode,
-                capacity_ms: args.capacity_ms,
-                target_buffer_ms: args.target_buffer_ms,
-                max_buffer_ms: args.max_buffer_ms,
-                start_threshold_ms: args.start_threshold_ms,
-                low_latency: true,
-                low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
-                low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
-                output_ring_ms: args.output_ring_ms,
-                output_ring_capacity_ms: args.output_ring_capacity_ms,
-                render_chunk_ms: args.render_chunk_ms,
-                realtime_renderer: true,
-                output_buffer_size_frames: args.output_buffer_size_frames,
-            },
-            LatencyMode::Fixed200Ms => Self {
-                latency_mode,
-                capacity_ms: args.capacity_ms.max(FIXED_LATENCY_CAPACITY_MS),
-                target_buffer_ms: FIXED_LATENCY_MS,
-                max_buffer_ms: FIXED_LATENCY_MAX_BUFFER_MS,
-                start_threshold_ms: FIXED_LATENCY_MS,
-                low_latency: false,
-                low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
-                low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
-                output_ring_ms: args.output_ring_ms,
-                output_ring_capacity_ms: args.output_ring_capacity_ms,
-                render_chunk_ms: args.render_chunk_ms,
-                realtime_renderer: args.realtime_renderer,
-                output_buffer_size_frames: args.output_buffer_size_frames,
-            },
-        };
-
-        Ok(timing)
+        Ok(Self {
+            capacity_ms: fixed_delay_capacity_ms(fixed_delay_frames, args.sample_rate),
+            target_buffer_ms: fixed_delay_ms,
+            fixed_delay_frames,
+            output_ring_ms: args.output_ring_ms,
+            output_ring_capacity_ms: args.output_ring_capacity_ms,
+            render_chunk_ms: args.render_chunk_ms,
+            output_buffer_size_frames: args.output_buffer_size_frames,
+        })
     }
+}
+
+fn ms_to_frames(ms: u32, sample_rate: u32) -> u64 {
+    sample_rate as u64 * ms as u64 / 1000
+}
+
+fn frames_to_ms_ceil(frames: u64, sample_rate: u32) -> u32 {
+    let sample_rate = u64::from(sample_rate.max(1));
+    frames
+        .saturating_mul(1000)
+        .saturating_add(sample_rate - 1)
+        .checked_div(sample_rate)
+        .unwrap_or(0)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+fn frames_to_ms_f64(frames: u64, sample_rate: u32) -> f64 {
+    frames as f64 * 1000.0 / sample_rate.max(1) as f64
+}
+
+fn format_fixed_delay(frames: u64, sample_rate: u32) -> String {
+    format!("{frames}fr/{:.3}ms", frames_to_ms_f64(frames, sample_rate))
+}
+
+fn fixed_delay_capacity_ms(fixed_delay_frames: u64, sample_rate: u32) -> u32 {
+    frames_to_ms_ceil(fixed_delay_frames, sample_rate)
+        .saturating_mul(3)
+        .max(FIXED_LATENCY_MIN_CAPACITY_MS)
 }
 
 fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
@@ -268,32 +185,14 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
     if args.channels != CHANNELS {
         bail!("only stereo packets are supported today");
     }
-    if timing.target_buffer_ms == 0 || timing.start_threshold_ms == 0 {
+    if timing.fixed_delay_frames == 0 {
+        bail!("fixed delay must be greater than zero frames");
+    }
+    if timing.target_buffer_ms == 0 {
         bail!("buffer timing values must be greater than zero");
-    }
-    if timing.max_buffer_ms <= timing.target_buffer_ms {
-        bail!("--max-buffer-ms must be greater than --target-buffer-ms");
-    }
-    if args.kp < 0.0 || args.ki < 0.0 {
-        bail!("--kp and --ki must be zero or greater");
-    }
-    if !(0.0..=1.0).contains(&args.error_filter_alpha) {
-        bail!("--error-filter-alpha must be between 0.0 and 1.0");
-    }
-    if args.integral_limit_ms_sec < 0.0 {
-        bail!("--integral-limit-ms-sec must be zero or greater");
     }
     if args.output_buffer_size_frames == Some(0) {
         bail!("--output-buffer-size-frames must be greater than zero");
-    }
-    if timing.low_latency && timing.low_latency_trim_margin_ms == 0 {
-        bail!("--low-latency-trim-margin-ms must be greater than zero");
-    }
-    if timing.low_latency_trim_to_margin_ms > timing.low_latency_trim_margin_ms {
-        bail!("--low-latency-trim-to-margin-ms must be less than or equal to --low-latency-trim-margin-ms");
-    }
-    if args.trim_crossfade_ms < 0.0 {
-        bail!("--trim-crossfade-ms must be zero or greater");
     }
     if timing.output_ring_ms == 0
         || timing.output_ring_capacity_ms == 0
@@ -313,13 +212,12 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
 fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
     let socket = bind_socket(args.listen, args.socket_recv_buffer_bytes)?;
     println!(
-        "receiver: listening={} output={} output_file={:?} latency_mode={} target_buffer={}ms max_buffer={}ms",
+        "receiver: listening={} output={} output_file={:?} fixed_delay={} capacity={}ms",
         args.listen,
         output_mode(args),
         args.output_file,
-        timing.latency_mode.as_str(),
-        timing.target_buffer_ms,
-        timing.max_buffer_ms
+        format_fixed_delay(timing.fixed_delay_frames, args.sample_rate),
+        timing.capacity_ms
     );
 
     let jitter_config = JitterConfig {
@@ -327,19 +225,7 @@ fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
         channels: args.channels,
         capacity_ms: timing.capacity_ms,
         target_ms: timing.target_buffer_ms,
-        max_buffer_ms: timing.max_buffer_ms,
-        start_threshold_ms: timing.start_threshold_ms,
-        adaptive_resampling: !args.no_adaptive_resampling,
-        kp: args.kp,
-        ki: args.ki,
-        error_filter_alpha: args.error_filter_alpha,
-        integral_limit_ms_sec: args.integral_limit_ms_sec,
-        max_ppm: args.max_ppm,
-        emergency_max_ppm: args.emergency_max_ppm,
-        low_latency: timing.low_latency,
-        low_latency_trim_margin_ms: timing.low_latency_trim_margin_ms,
-        low_latency_trim_to_margin_ms: timing.low_latency_trim_to_margin_ms,
-        trim_crossfade_ms: args.trim_crossfade_ms,
+        fixed_delay_frames: timing.fixed_delay_frames,
     };
     let (event_tx, event_rx) = sync_channel(args.packet_queue_capacity);
     let ingress_metrics = Arc::new(IngressMetrics::default());
@@ -583,7 +469,7 @@ fn run_timed_pull_output(
         }
 
         drain_receiver_events(&event_rx, &mut jitter);
-        jitter.pull_f32(&mut output);
+        jitter.pull_f32_at_sample_rate_for_playout(&mut output, args.sample_rate, next_tick);
         receiver_state.publish(&jitter);
 
         if let Some(writer) = writer.as_mut() {
@@ -640,8 +526,7 @@ fn run_audio_output(
             channels,
             output_ring_ms: timing.output_ring_ms,
             render_chunk_ms: timing.render_chunk_ms,
-            low_latency: timing.low_latency,
-            realtime_priority: timing.low_latency || timing.realtime_renderer,
+            realtime_priority: true,
         },
     );
     let stream = build_ring_output_stream(
@@ -774,7 +659,6 @@ struct RingRendererConfig {
     channels: usize,
     output_ring_ms: u32,
     render_chunk_ms: u32,
-    low_latency: bool,
     realtime_priority: bool,
 }
 
@@ -800,8 +684,8 @@ fn spawn_ring_renderer(
                 (config.output_sample_rate as usize * config.render_chunk_ms as usize / 1000)
                     .max(1);
             let mut render_scratch = vec![0.0f32; chunk_frames * channels];
-            let sleep_divisor = if config.low_latency { 4 } else { 2 };
-            let min_sleep_us = if config.low_latency { 500 } else { 1_000 };
+            let sleep_divisor = 2;
+            let min_sleep_us = 1_000;
             let sleep_duration = Duration::from_micros(
                 ((config.render_chunk_ms as u64 * 1000) / sleep_divisor).max(min_sleep_us),
             );
@@ -824,7 +708,14 @@ fn spawn_ring_renderer(
                     let sample_count = frames_to_render * channels;
                     let scratch = &mut render_scratch[..sample_count];
 
-                    jitter.pull_f32_at_sample_rate(scratch, config.output_sample_rate);
+                    let queued_frames = queued / channels;
+                    let first_playout_at = Instant::now()
+                        + duration_from_frames(queued_frames, config.output_sample_rate);
+                    jitter.pull_f32_at_sample_rate_for_playout(
+                        scratch,
+                        config.output_sample_rate,
+                        first_playout_at,
+                    );
 
                     let pushed = ring.push_interleaved(scratch, channels);
                     if pushed < sample_count {
@@ -894,6 +785,10 @@ where
 fn samples_from_ms(sample_rate: u32, channels: usize, ms: u32) -> usize {
     let channels = channels.max(1);
     ((sample_rate as usize * ms as usize / 1000).max(1)).saturating_mul(channels)
+}
+
+fn duration_from_frames(frames: usize, sample_rate: u32) -> Duration {
+    Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64)
 }
 
 fn scratch_len_for_stream(config: &StreamConfig) -> usize {
@@ -1188,8 +1083,6 @@ impl MetricsPrinter {
             .as_ref()
             .map(|metrics| metrics.snapshot())
             .unwrap_or_default();
-        let trimmed_frames = metrics.trimmed_frames - previous.trimmed_frames;
-        let trimmed_ms_per_sec = trimmed_frames as f64 * 1000.0 / SAMPLE_RATE as f64 / elapsed;
         let queue_drop_delta = ingress
             .queue_drops
             .saturating_sub(self.last_ingress.queue_drops);
@@ -1223,8 +1116,19 @@ impl MetricsPrinter {
         let output_queue_ms = callback_metrics.output_queue_samples as f64 * 1000.0
             / self.output_sample_rate.max(1) as f64
             / self.output_channels.max(1) as f64;
+        let output_queue_frames =
+            callback_metrics.output_queue_samples / u64::from(self.output_channels.max(1));
+        let output_queue_source_frames = ((output_queue_frames as f64 * SAMPLE_RATE as f64)
+            / self.output_sample_rate.max(1) as f64)
+            .round() as u64;
+        let total_buffered_frames = metrics
+            .buffer_level_frames
+            .saturating_add(output_queue_source_frames);
+        let total_buffered_ms = frames_to_ms_f64(total_buffered_frames, SAMPLE_RATE);
+        let fixed_delay_frames = metrics.fixed_delay_frames;
+        let fixed_delay_ms = frames_to_ms_f64(fixed_delay_frames, SAMPLE_RATE);
         println!(
-            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s latency={:.1}ms target={}ms outq={:.1}ms err={:.1}ms filt={:.1}ms device_ratio={:.6} corr={:.1}ppm int={:.1}ppm ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s trims={} trim={:.1}ms/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s lock_miss={:.1}/s ring_under={:.1}/s ring_missing={:.0}/s ring_overflow={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             queued_packet_delta as f64 / elapsed,
@@ -1234,14 +1138,15 @@ impl MetricsPrinter {
             (metrics.late_packets - previous.late_packets) as f64 / elapsed,
             (metrics.duplicate_packets - previous.duplicate_packets) as f64 / elapsed,
             (metrics.out_of_order_packets - previous.out_of_order_packets) as f64 / elapsed,
+            metrics.buffer_level_frames,
             metrics.audio_latency_ms,
-            target_ms,
+            fixed_delay_frames,
+            fixed_delay_ms,
+            output_queue_frames,
             output_queue_ms,
-            metrics.buffer_error_ms,
-            metrics.filtered_error_ms,
+            total_buffered_frames,
+            total_buffered_ms,
             metrics.device_resample_ratio,
-            metrics.correction_ppm,
-            metrics.integral_correction_ppm,
             metrics.effective_resample_ratio,
             metrics.estimated_drift_ppm,
             metrics.startup_underruns,
@@ -1255,8 +1160,6 @@ impl MetricsPrinter {
             ring_missing_delta as f64 / elapsed,
             ring_overflow_delta as f64 / elapsed,
             scratch_overflow_delta as f64 / elapsed,
-            metrics.latency_trims,
-            trimmed_ms_per_sec,
             metrics.resyncs,
             metrics.resyncs_by_stream_change,
             metrics.resyncs_by_underrun
@@ -1268,19 +1171,23 @@ impl MetricsPrinter {
                 latest_sequence: metrics.latest_sequence.unwrap_or_default(),
                 target_ms,
                 output_sample_rate: self.output_sample_rate,
+                target_frames: fixed_delay_frames,
+                fixed_delay_frames,
                 received_packets: metrics.received_packets,
                 steady_underruns: metrics.steady_underruns,
                 startup_underruns: metrics.startup_underruns,
                 callback_lock_misses: callback_metrics.lock_misses,
-                latency_trims: metrics.latency_trims,
                 resyncs: metrics.resyncs,
                 scratch_overflows: callback_metrics.scratch_overflows,
                 ring_underruns: callback_metrics.ring_underruns,
                 ring_missing_frames: callback_metrics.ring_missing_frames,
                 packet_queue_drops: ingress.queue_drops,
+                audio_latency_frames: metrics.buffer_level_frames,
+                output_queue_frames,
+                total_buffered_frames,
                 audio_latency_ms: metrics.audio_latency_ms,
                 output_queue_ms: output_queue_ms as f32,
-                correction_ppm: metrics.correction_ppm,
+                total_buffered_ms: total_buffered_ms as f32,
                 effective_ratio: metrics.effective_resample_ratio,
                 receiver_time_ns: unix_time_ns(),
             });
@@ -1374,23 +1281,8 @@ mod tests {
             test_tone: false,
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
-            capacity_ms: 1000,
-            target_buffer_ms: 100,
-            max_buffer_ms: 300,
-            start_threshold_ms: 100,
-            kp: 5.0,
-            ki: 0.2,
-            error_filter_alpha: 0.05,
-            integral_limit_ms_sec: 1000.0,
-            max_ppm: 1000.0,
-            emergency_max_ppm: 5000.0,
-            no_adaptive_resampling: false,
-            latency_mode: LatencyMode::Normal,
-            low_latency: false,
-            low_latency_trim_margin_ms: 10,
-            low_latency_trim_to_margin_ms: 10,
-            trim_crossfade_ms: 1.5,
-            realtime_renderer: false,
+            fixed_delay_frames: None,
+            fixed_latency_ms: None,
             output_buffer_size_frames: None,
             output_ring_ms: 40,
             output_ring_capacity_ms: 200,
@@ -1404,53 +1296,48 @@ mod tests {
     }
 
     #[test]
-    fn fixed_200ms_mode_overrides_jitter_buffer_timing() {
-        let mut args = default_args();
-        args.latency_mode = LatencyMode::Fixed200Ms;
-        args.capacity_ms = 100;
-        args.target_buffer_ms = 20;
-        args.start_threshold_ms = 20;
-        args.max_buffer_ms = 60;
-        args.low_latency = false;
-
+    fn default_fixed_delay_is_300ms_at_48k() {
+        let args = default_args();
         let timing = ReceiverTiming::from_args(&args).unwrap();
 
-        assert_eq!(timing.latency_mode, LatencyMode::Fixed200Ms);
-        assert_eq!(timing.capacity_ms, FIXED_LATENCY_CAPACITY_MS);
-        assert_eq!(timing.target_buffer_ms, FIXED_LATENCY_MS);
-        assert_eq!(timing.start_threshold_ms, FIXED_LATENCY_MS);
-        assert_eq!(timing.max_buffer_ms, FIXED_LATENCY_MAX_BUFFER_MS);
-        assert!(!timing.low_latency);
+        assert_eq!(timing.fixed_delay_frames, DEFAULT_FIXED_DELAY_FRAMES);
+        assert_eq!(timing.target_buffer_ms, 300);
+        assert_eq!(
+            timing.capacity_ms,
+            fixed_delay_capacity_ms(DEFAULT_FIXED_DELAY_FRAMES, SAMPLE_RATE)
+        );
         validate_audio_args(&args, &timing).unwrap();
     }
 
     #[test]
-    fn fixed_latency_mode_accepts_current_name_and_old_alias() {
-        let current = Args::try_parse_from(["receiver", "--latency-mode", "fixed-200ms"]).unwrap();
-        assert_eq!(current.latency_mode, LatencyMode::Fixed200Ms);
-
-        let old_alias =
-            Args::try_parse_from(["receiver", "--latency-mode", "fixed-500ms"]).unwrap();
-        assert_eq!(old_alias.latency_mode, LatencyMode::Fixed200Ms);
-    }
-
-    #[test]
-    fn low_latency_flag_still_selects_low_latency_mode() {
+    fn fixed_delay_frames_is_primary() {
         let mut args = default_args();
-        args.low_latency = true;
+        args.fixed_delay_frames = Some(9_600);
 
         let timing = ReceiverTiming::from_args(&args).unwrap();
 
-        assert_eq!(timing.latency_mode, LatencyMode::Low);
-        assert!(timing.low_latency);
-        assert!(timing.realtime_renderer);
+        assert_eq!(timing.fixed_delay_frames, 9_600);
+        assert_eq!(timing.target_buffer_ms, 200);
+        validate_audio_args(&args, &timing).unwrap();
     }
 
     #[test]
-    fn low_latency_flag_cannot_be_combined_with_explicit_mode() {
+    fn fixed_latency_ms_is_alias_for_frames() {
         let mut args = default_args();
-        args.low_latency = true;
-        args.latency_mode = LatencyMode::Fixed200Ms;
+        args.fixed_latency_ms = Some(250);
+
+        let timing = ReceiverTiming::from_args(&args).unwrap();
+
+        assert_eq!(timing.fixed_delay_frames, 12_000);
+        assert_eq!(timing.target_buffer_ms, 250);
+        validate_audio_args(&args, &timing).unwrap();
+    }
+
+    #[test]
+    fn fixed_delay_frames_and_ms_alias_cannot_be_combined() {
+        let mut args = default_args();
+        args.fixed_delay_frames = Some(9_600);
+        args.fixed_latency_ms = Some(200);
 
         assert!(ReceiverTiming::from_args(&args).is_err());
     }

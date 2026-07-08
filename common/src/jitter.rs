@@ -1,7 +1,7 @@
 use crate::audio::{f32_to_i16, i16_to_f32, StereoFrame, CHANNELS, SAMPLE_RATE};
 use crate::packet::AudioPacket;
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct JitterConfig {
@@ -9,19 +9,7 @@ pub struct JitterConfig {
     pub channels: u16,
     pub capacity_ms: u32,
     pub target_ms: u32,
-    pub max_buffer_ms: u32,
-    pub start_threshold_ms: u32,
-    pub adaptive_resampling: bool,
-    pub kp: f32,
-    pub ki: f32,
-    pub error_filter_alpha: f32,
-    pub integral_limit_ms_sec: f32,
-    pub max_ppm: f32,
-    pub emergency_max_ppm: f32,
-    pub low_latency: bool,
-    pub low_latency_trim_margin_ms: u32,
-    pub low_latency_trim_to_margin_ms: u32,
-    pub trim_crossfade_ms: f32,
+    pub fixed_delay_frames: u64,
 }
 
 impl Default for JitterConfig {
@@ -30,20 +18,8 @@ impl Default for JitterConfig {
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
             capacity_ms: 1000,
-            target_ms: 100,
-            max_buffer_ms: 300,
-            start_threshold_ms: 100,
-            adaptive_resampling: true,
-            kp: 5.0,
-            ki: 0.2,
-            error_filter_alpha: 0.05,
-            integral_limit_ms_sec: 1000.0,
-            max_ppm: 1000.0,
-            emergency_max_ppm: 5000.0,
-            low_latency: false,
-            low_latency_trim_margin_ms: 10,
-            low_latency_trim_to_margin_ms: 10,
-            trim_crossfade_ms: 1.5,
+            target_ms: 300,
+            fixed_delay_frames: 14_400,
         }
     }
 }
@@ -71,22 +47,18 @@ pub struct JitterMetrics {
     pub steady_underruns: u64,
     pub missing_frame_calls: u64,
     pub missing_frames: u64,
-    pub latency_trims: u64,
-    pub trimmed_frames: u64,
     pub resyncs: u64,
     pub resyncs_by_stream_change: u64,
     pub resyncs_by_underrun: u64,
     pub stream_id: Option<u64>,
     pub latest_sequence: Option<u32>,
     pub latest_sample_position: Option<u64>,
+    pub fixed_delay_frames: u64,
+    pub buffer_level_frames: u64,
     pub buffer_level_ms: f32,
     pub audio_latency_ms: f32,
     pub resample_ratio: f32,
     pub device_resample_ratio: f32,
-    pub correction_ppm: f32,
-    pub buffer_error_ms: f32,
-    pub filtered_error_ms: f32,
-    pub integral_correction_ppm: f32,
     pub effective_resample_ratio: f32,
     pub estimated_drift_ppm: f32,
 }
@@ -107,22 +79,18 @@ impl Default for JitterMetrics {
             steady_underruns: 0,
             missing_frame_calls: 0,
             missing_frames: 0,
-            latency_trims: 0,
-            trimmed_frames: 0,
             resyncs: 0,
             resyncs_by_stream_change: 0,
             resyncs_by_underrun: 0,
             stream_id: None,
             latest_sequence: None,
             latest_sample_position: None,
+            fixed_delay_frames: 0,
+            buffer_level_frames: 0,
             buffer_level_ms: 0.0,
             audio_latency_ms: 0.0,
             resample_ratio: 1.0,
             device_resample_ratio: 1.0,
-            correction_ppm: 0.0,
-            buffer_error_ms: 0.0,
-            filtered_error_ms: 0.0,
-            integral_correction_ppm: 0.0,
             effective_resample_ratio: 1.0,
             estimated_drift_ppm: 0.0,
         }
@@ -160,14 +128,9 @@ pub struct JitterBuffer {
     expected_sequence: Option<u32>,
     first_drift_sample: Option<u64>,
     first_drift_arrival: Option<Instant>,
+    fixed_anchor_sample: Option<u64>,
+    fixed_anchor_playout_at: Option<Instant>,
     consecutive_missing_frames: u64,
-    filtered_error_ms: f32,
-    error_filter_initialized: bool,
-    integral_error_ms_sec: f32,
-    trim_fade_from: StereoFrame,
-    trim_fade_remaining: u32,
-    trim_fade_total: u32,
-    last_output_frame: StereoFrame,
     metrics: JitterMetrics,
 }
 
@@ -183,14 +146,9 @@ impl JitterBuffer {
             expected_sequence: None,
             first_drift_sample: None,
             first_drift_arrival: None,
+            fixed_anchor_sample: None,
+            fixed_anchor_playout_at: None,
             consecutive_missing_frames: 0,
-            filtered_error_ms: 0.0,
-            error_filter_initialized: false,
-            integral_error_ms_sec: 0.0,
-            trim_fade_from: StereoFrame::SILENCE,
-            trim_fade_remaining: 0,
-            trim_fade_total: 0,
-            last_output_frame: StereoFrame::SILENCE,
             metrics: JitterMetrics::default(),
         }
     }
@@ -213,7 +171,12 @@ impl JitterBuffer {
             }
             self.stream_id = Some(packet.header.stream_id);
             self.read_pos = packet.header.sample_position as f64;
+            self.set_fixed_schedule(packet.header.sample_position, arrival);
             self.state = JitterState::Priming;
+        } else if self.fixed_anchor_playout_at.is_none() {
+            self.read_pos = packet.header.sample_position as f64;
+            self.state = JitterState::Priming;
+            self.set_fixed_schedule(packet.header.sample_position, arrival);
         }
 
         self.update_sequence_metrics(packet.header.sequence);
@@ -259,6 +222,24 @@ impl JitterBuffer {
     }
 
     pub fn pull_f32_at_sample_rate(&mut self, output: &mut [f32], output_sample_rate: u32) {
+        self.pull_f32_at_sample_rate_for_playout(output, output_sample_rate, Instant::now());
+    }
+
+    pub fn pull_f32_at_sample_rate_for_playout(
+        &mut self,
+        output: &mut [f32],
+        output_sample_rate: u32,
+        first_output_playout_at: Instant,
+    ) {
+        self.pull_fixed_f32_at_sample_rate(output, output_sample_rate, first_output_playout_at);
+    }
+
+    fn pull_fixed_f32_at_sample_rate(
+        &mut self,
+        output: &mut [f32],
+        output_sample_rate: u32,
+        first_output_playout_at: Instant,
+    ) {
         output.fill(0.0);
         if output.is_empty() || self.config.channels == 0 {
             return;
@@ -266,41 +247,65 @@ impl JitterBuffer {
 
         let channels = self.config.channels as usize;
         let output_sample_rate = output_sample_rate.max(1);
-        let device_resample_ratio = self.config.sample_rate as f32 / output_sample_rate as f32;
+        let device_resample_ratio = self.config.sample_rate as f64 / output_sample_rate as f64;
+        self.set_resample_metrics(device_resample_ratio as f32);
 
-        self.maybe_start();
-        if self.state != JitterState::Running {
+        let output_frames = output.len() / channels;
+        let chunk_duration = duration_from_frames(output_frames, output_sample_rate);
+        let chunk_end_playout_at = first_output_playout_at + chunk_duration;
+
+        let (Some(anchor_sample), Some(anchor_playout_at)) =
+            (self.fixed_anchor_sample, self.fixed_anchor_playout_at)
+        else {
             if self.stream_id.is_some() {
                 self.metrics.startup_underruns += 1;
             }
-            self.reset_correction_metrics(device_resample_ratio);
+            self.refresh_metrics();
+            return;
+        };
+
+        if chunk_end_playout_at <= anchor_playout_at {
+            if self.stream_id.is_some() {
+                self.metrics.startup_underruns += 1;
+            }
+            self.state = JitterState::Priming;
+            self.read_pos = anchor_sample as f64;
             self.refresh_metrics();
             return;
         }
-        self.trim_excess_latency();
 
-        let output_frames = output.len() / channels;
-        let output_duration_secs = output_frames as f32 / output_sample_rate as f32;
-        let correction_ppm = self.compute_correction_ppm(output_duration_secs);
-        let correction_ratio = 1.0 + correction_ppm / 1_000_000.0;
-        let ratio = correction_ratio * device_resample_ratio;
-        self.metrics.device_resample_ratio = device_resample_ratio;
-        self.metrics.correction_ppm = correction_ppm;
-        self.metrics.effective_resample_ratio = ratio;
-        self.metrics.resample_ratio = ratio;
+        let mut start_frame = 0usize;
+        if self.state != JitterState::Running {
+            self.state = JitterState::Running;
+            self.read_pos = anchor_sample as f64;
+
+            if let Some(wait) = anchor_playout_at.checked_duration_since(first_output_playout_at) {
+                start_frame = ((wait.as_secs_f64() * output_sample_rate as f64).ceil() as usize)
+                    .min(output_frames);
+                let first_audio_playout_at =
+                    first_output_playout_at + duration_from_frames(start_frame, output_sample_rate);
+                if let Some(elapsed) =
+                    first_audio_playout_at.checked_duration_since(anchor_playout_at)
+                {
+                    self.read_pos = anchor_sample as f64
+                        + elapsed.as_secs_f64() * self.config.sample_rate as f64;
+                }
+            } else {
+                let elapsed = first_output_playout_at.duration_since(anchor_playout_at);
+                self.read_pos =
+                    anchor_sample as f64 + elapsed.as_secs_f64() * self.config.sample_rate as f64;
+            }
+        }
 
         let mut missing_in_call = 0u64;
-        let mut read_pos = self.read_pos;
         let mut consecutive_missing_frames = self.consecutive_missing_frames;
-        let trim_fade_from = self.trim_fade_from;
-        let mut trim_fade_remaining = self.trim_fade_remaining;
-        let trim_fade_total = self.trim_fade_total;
-        let mut last_output_frame = self.last_output_frame;
+        let mut read_pos = self.read_pos;
+
         {
             let packets = &self.packets;
             let mut packet_cache = None;
-            for frame_out in output.chunks_exact_mut(channels) {
-                let pos0 = read_pos.floor() as u64;
+            for frame_out in output.chunks_exact_mut(channels).skip(start_frame) {
+                let pos0 = read_pos.floor().max(0.0) as u64;
                 let frac = (read_pos - pos0 as f64) as f32;
 
                 match (
@@ -308,31 +313,18 @@ impl JitterBuffer {
                     sample_at_cached(packets, channels, pos0 + 1, &mut packet_cache),
                 ) {
                     (Some(a), Some(b)) => {
-                        let frame = apply_trim_fade_to_frame(
-                            a.lerp(b, frac),
-                            trim_fade_from,
-                            &mut trim_fade_remaining,
-                            trim_fade_total,
-                        );
+                        let frame = a.lerp(b, frac);
                         frame_out[0] = frame.left;
                         if channels > 1 {
                             frame_out[1] = frame.right;
                         }
-                        last_output_frame = frame;
                         consecutive_missing_frames = 0;
                     }
                     (Some(a), None) => {
-                        let frame = apply_trim_fade_to_frame(
-                            a,
-                            trim_fade_from,
-                            &mut trim_fade_remaining,
-                            trim_fade_total,
-                        );
-                        frame_out[0] = frame.left;
+                        frame_out[0] = a.left;
                         if channels > 1 {
-                            frame_out[1] = frame.right;
+                            frame_out[1] = a.right;
                         }
-                        last_output_frame = frame;
                         consecutive_missing_frames = 0;
                     }
                     _ => {
@@ -340,14 +332,12 @@ impl JitterBuffer {
                         consecutive_missing_frames += 1;
                     }
                 }
-
-                read_pos += ratio as f64;
+                read_pos += device_resample_ratio;
             }
         }
+
         self.read_pos = read_pos;
         self.consecutive_missing_frames = consecutive_missing_frames;
-        self.trim_fade_remaining = trim_fade_remaining;
-        self.last_output_frame = last_output_frame;
 
         if missing_in_call > 0 {
             self.metrics.missing_frame_calls += 1;
@@ -355,10 +345,7 @@ impl JitterBuffer {
             if self.buffer_level_frames() < 2 {
                 self.metrics.output_underruns += 1;
                 self.metrics.steady_underruns += 1;
-                self.state = JitterState::Priming;
-                self.read_pos = self.latest_received_end as f64;
-                self.consecutive_missing_frames = 0;
-                self.reset_correction_metrics(device_resample_ratio);
+                self.clear_for_resync(ResyncReason::Underrun);
             } else if self.consecutive_missing_frames > self.config.sample_rate as u64 / 2 {
                 self.clear_for_resync(ResyncReason::Underrun);
             }
@@ -384,7 +371,10 @@ impl JitterBuffer {
         let mut metrics = self.metrics.clone();
         metrics.state = self.state;
         metrics.stream_id = self.stream_id;
-        let audio_latency_ms = self.buffer_level_ms();
+        let buffer_level_frames = self.buffer_level_frames();
+        let audio_latency_ms = self.frames_to_ms(buffer_level_frames);
+        metrics.fixed_delay_frames = self.config.fixed_delay_frames;
+        metrics.buffer_level_frames = buffer_level_frames;
         metrics.buffer_level_ms = audio_latency_ms;
         metrics.audio_latency_ms = audio_latency_ms;
         metrics
@@ -426,129 +416,21 @@ impl JitterBuffer {
         }
     }
 
-    fn maybe_start(&mut self) {
-        if matches!(
-            self.state,
-            JitterState::NotStarted | JitterState::Priming | JitterState::Resync
-        ) && self.buffer_level_frames() >= self.frames_from_ms(self.config.start_threshold_ms)
-        {
-            if let Some(first) = self.packets.keys().next().copied() {
-                let target_frames = self.frames_from_ms(self.config.target_ms);
-                let target_read_pos = self.latest_received_end.saturating_sub(target_frames);
-                self.read_pos = target_read_pos.max(first) as f64;
-            }
-            self.state = JitterState::Running;
-        }
+    fn set_fixed_schedule(&mut self, sample_position: u64, arrival: Instant) {
+        self.fixed_anchor_sample = Some(sample_position);
+        self.fixed_anchor_playout_at = Some(
+            arrival
+                + duration_from_source_frames(
+                    self.config.fixed_delay_frames,
+                    self.config.sample_rate,
+                ),
+        );
     }
 
-    fn compute_correction_ppm(&mut self, output_duration_secs: f32) -> f32 {
-        if !self.config.adaptive_resampling || self.state != JitterState::Running {
-            return 0.0;
-        }
-
-        let error_ms = self.buffer_level_ms() - self.config.target_ms as f32;
-        let alpha = self.config.error_filter_alpha.clamp(0.0, 1.0);
-        if self.error_filter_initialized {
-            self.filtered_error_ms += (error_ms - self.filtered_error_ms) * alpha;
-        } else {
-            self.filtered_error_ms = error_ms;
-            self.error_filter_initialized = true;
-        }
-
-        let integral_limit = self.config.integral_limit_ms_sec.max(0.0);
-        if integral_limit == 0.0 || self.config.ki == 0.0 {
-            self.integral_error_ms_sec = 0.0;
-        } else {
-            self.integral_error_ms_sec += self.filtered_error_ms * output_duration_secs.max(0.0);
-            self.integral_error_ms_sec = self
-                .integral_error_ms_sec
-                .clamp(-integral_limit, integral_limit);
-        }
-
-        let proportional_ppm = self.filtered_error_ms * self.config.kp;
-        let integral_ppm = self.integral_error_ms_sec * self.config.ki;
-        let max_ppm = if error_ms.abs() > self.config.target_ms as f32 {
-            self.config.emergency_max_ppm
-        } else {
-            self.config.max_ppm
-        };
-        let correction_ppm = (proportional_ppm + integral_ppm).clamp(-max_ppm, max_ppm);
-
-        self.metrics.buffer_error_ms = error_ms;
-        self.metrics.filtered_error_ms = self.filtered_error_ms;
-        self.metrics.integral_correction_ppm = integral_ppm;
-        correction_ppm
-    }
-
-    fn reset_correction_metrics(&mut self, device_resample_ratio: f32) {
-        self.filtered_error_ms = 0.0;
-        self.error_filter_initialized = false;
-        self.integral_error_ms_sec = 0.0;
+    fn set_resample_metrics(&mut self, device_resample_ratio: f32) {
         self.metrics.device_resample_ratio = device_resample_ratio;
-        self.metrics.correction_ppm = 0.0;
-        self.metrics.buffer_error_ms = self.buffer_level_ms() - self.config.target_ms as f32;
-        self.metrics.filtered_error_ms = 0.0;
-        self.metrics.integral_correction_ppm = 0.0;
         self.metrics.effective_resample_ratio = device_resample_ratio;
         self.metrics.resample_ratio = device_resample_ratio;
-    }
-
-    fn trim_excess_latency(&mut self) {
-        if self.config.max_buffer_ms <= self.config.target_ms {
-            return;
-        }
-
-        let target_frames = self.trim_target_frames();
-        let level = self.buffer_level_frames();
-        let ceiling_frames = self.trim_ceiling_frames();
-        if level <= ceiling_frames || self.latest_received_end <= target_frames {
-            return;
-        }
-
-        let new_read_pos = self.latest_received_end - target_frames;
-        let old_read_pos = self.read_pos.floor().max(0.0) as u64;
-        if new_read_pos > old_read_pos {
-            let skipped = new_read_pos - old_read_pos;
-            self.read_pos = new_read_pos as f64;
-            self.metrics.latency_trims += 1;
-            self.metrics.trimmed_frames += skipped;
-            self.start_trim_fade();
-            self.prune_played_packets();
-        }
-    }
-
-    fn trim_ceiling_frames(&self) -> u64 {
-        let max_frames = self.frames_from_ms(self.config.max_buffer_ms);
-        if self.config.low_latency {
-            let low_latency_ceiling = self
-                .frames_from_ms(self.config.target_ms)
-                .saturating_add(self.frames_from_ms(self.config.low_latency_trim_margin_ms));
-            low_latency_ceiling.min(max_frames)
-        } else {
-            max_frames
-        }
-    }
-
-    fn trim_target_frames(&self) -> u64 {
-        let target_frames = self.frames_from_ms(self.config.target_ms);
-        if self.config.low_latency {
-            target_frames
-                .saturating_add(self.frames_from_ms(self.config.low_latency_trim_to_margin_ms))
-        } else {
-            target_frames
-        }
-    }
-
-    fn start_trim_fade(&mut self) {
-        let frames = self.frames_from_ms_f32(self.config.trim_crossfade_ms);
-        if frames == 0 {
-            self.trim_fade_remaining = 0;
-            self.trim_fade_total = 0;
-            return;
-        }
-        self.trim_fade_from = self.last_output_frame;
-        self.trim_fade_remaining = frames;
-        self.trim_fade_total = frames;
     }
 
     fn prune_played_packets(&mut self) {
@@ -594,13 +476,9 @@ impl JitterBuffer {
         self.expected_sequence = None;
         self.first_drift_sample = None;
         self.first_drift_arrival = None;
+        self.fixed_anchor_sample = None;
+        self.fixed_anchor_playout_at = None;
         self.consecutive_missing_frames = 0;
-        self.filtered_error_ms = 0.0;
-        self.error_filter_initialized = false;
-        self.integral_error_ms_sec = 0.0;
-        self.trim_fade_remaining = 0;
-        self.trim_fade_total = 0;
-        self.last_output_frame = StereoFrame::SILENCE;
         self.state = JitterState::Resync;
         self.metrics.resyncs += 1;
         match reason {
@@ -612,7 +490,10 @@ impl JitterBuffer {
     fn refresh_metrics(&mut self) {
         self.metrics.state = self.state;
         self.metrics.stream_id = self.stream_id;
-        let audio_latency_ms = self.buffer_level_ms();
+        let buffer_level_frames = self.buffer_level_frames();
+        let audio_latency_ms = self.frames_to_ms(buffer_level_frames);
+        self.metrics.fixed_delay_frames = self.config.fixed_delay_frames;
+        self.metrics.buffer_level_frames = buffer_level_frames;
         self.metrics.buffer_level_ms = audio_latency_ms;
         self.metrics.audio_latency_ms = audio_latency_ms;
     }
@@ -622,20 +503,21 @@ impl JitterBuffer {
             .saturating_sub(self.read_pos.floor().max(0.0) as u64)
     }
 
-    fn buffer_level_ms(&self) -> f32 {
-        self.buffer_level_frames() as f32 * 1000.0 / self.config.sample_rate as f32
+    fn frames_to_ms(&self, frames: u64) -> f32 {
+        frames as f32 * 1000.0 / self.config.sample_rate as f32
     }
 
     fn frames_from_ms(&self, ms: u32) -> u64 {
         self.config.sample_rate as u64 * ms as u64 / 1000
     }
+}
 
-    fn frames_from_ms_f32(&self, ms: f32) -> u32 {
-        if ms <= 0.0 {
-            return 0;
-        }
-        ((self.config.sample_rate as f32 * ms / 1000.0).round() as u32).max(1)
-    }
+fn duration_from_frames(frames: usize, sample_rate: u32) -> Duration {
+    Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64)
+}
+
+fn duration_from_source_frames(frames: u64, sample_rate: u32) -> Duration {
+    Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64)
 }
 
 fn sample_at_cached<'a>(
@@ -657,22 +539,6 @@ fn sample_at_cached<'a>(
 
     *cache = Some((*start, packet));
     sample_from_packet(*start, packet, channels, position)
-}
-
-fn apply_trim_fade_to_frame(
-    frame: StereoFrame,
-    trim_fade_from: StereoFrame,
-    trim_fade_remaining: &mut u32,
-    trim_fade_total: u32,
-) -> StereoFrame {
-    if *trim_fade_remaining == 0 || trim_fade_total == 0 {
-        return frame;
-    }
-
-    let done = trim_fade_total - *trim_fade_remaining;
-    let frac = done as f32 / trim_fade_total as f32;
-    *trim_fade_remaining -= 1;
-    trim_fade_from.lerp(frame, frac)
 }
 
 fn sample_from_packet(
@@ -727,17 +593,36 @@ mod tests {
     }
 
     #[test]
-    fn starts_after_threshold_and_outputs_audio() {
+    fn fixed_delay_waits_until_scheduled_playout_time() {
+        let t0 = Instant::now();
         let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 5,
-            target_ms: 5,
+            target_ms: 100,
+            fixed_delay_frames: 4_800,
             ..JitterConfig::default()
         });
-        buffer.insert_packet(packet(0, 0), Instant::now());
+        buffer.insert_packet(packet(0, 0), t0);
+
         let mut out = vec![0.0; 240 * 2];
-        buffer.pull_f32(&mut out);
-        assert_eq!(buffer.metrics().state, JitterState::Running);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            SAMPLE_RATE,
+            t0 + Duration::from_millis(90),
+        );
+
+        assert_eq!(buffer.metrics().state, JitterState::Priming);
+        assert!(out.iter().all(|sample| *sample == 0.0));
+
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            SAMPLE_RATE,
+            t0 + Duration::from_millis(100),
+        );
+
+        let metrics = buffer.metrics();
+        assert_eq!(metrics.state, JitterState::Running);
         assert!(out.iter().any(|sample| *sample != 0.0));
+        assert_eq!(metrics.fixed_delay_frames, 4_800);
+        assert_eq!(metrics.effective_resample_ratio, 1.0);
     }
 
     #[test]
@@ -764,22 +649,26 @@ mod tests {
 
     #[test]
     fn counts_priming_silence_separately_from_steady_underruns() {
+        let t0 = Instant::now();
         let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 20,
-            target_ms: 5,
+            target_ms: 100,
+            fixed_delay_frames: 4_800,
             ..JitterConfig::default()
         });
-        buffer.insert_packet(packet(0, 0), Instant::now());
+        buffer.insert_packet(packet(0, 0), t0);
 
         let mut out = vec![0.0; 240 * 2];
-        buffer.pull_f32(&mut out);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            SAMPLE_RATE,
+            t0 + Duration::from_millis(50),
+        );
 
         let metrics = buffer.metrics();
         assert_eq!(metrics.state, JitterState::Priming);
         assert_eq!(metrics.startup_underruns, 1);
         assert_eq!(metrics.steady_underruns, 0);
         assert_eq!(metrics.output_underruns, 0);
-        assert_eq!(metrics.correction_ppm, 0.0);
         assert_eq!(metrics.effective_resample_ratio, 1.0);
     }
 
@@ -802,46 +691,33 @@ mod tests {
     }
 
     #[test]
-    fn starts_near_target_latency_when_over_primed() {
+    fn consumes_fixed_delay_48k_stream_at_44k1_output_rate() {
+        let t0 = Instant::now();
         let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 50,
             target_ms: 100,
-            max_buffer_ms: 300,
+            fixed_delay_frames: 4_800,
             ..JitterConfig::default()
         });
         for sequence in 0..200 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
-        }
-
-        let mut out = vec![0.0; 240 * 2];
-        buffer.pull_f32(&mut out);
-
-        assert_eq!(buffer.metrics().state, JitterState::Running);
-        assert!(buffer.metrics().buffer_level_ms <= 110.0);
-    }
-
-    #[test]
-    fn consumes_48k_stream_at_44k1_output_rate() {
-        let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 50,
-            target_ms: 100,
-            max_buffer_ms: 300,
-            adaptive_resampling: false,
-            ..JitterConfig::default()
-        });
-        for sequence in 0..200 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), t0);
         }
 
         let mut out = vec![0.0; 441 * 2];
-        buffer.pull_f32_at_sample_rate(&mut out, 44_100);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            44_100,
+            t0 + Duration::from_millis(100),
+        );
         assert_eq!(buffer.metrics().state, JitterState::Running);
-        assert!(buffer.metrics().buffer_level_ms <= 100.0);
 
-        buffer.insert_packet(packet(200, 200 * 240), Instant::now());
-        buffer.insert_packet(packet(201, 201 * 240), Instant::now());
+        buffer.insert_packet(packet(200, 200 * 240), t0);
+        buffer.insert_packet(packet(201, 201 * 240), t0);
         let before = buffer.metrics().buffer_level_ms;
-        buffer.pull_f32_at_sample_rate(&mut out, 44_100);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            44_100,
+            t0 + Duration::from_millis(110),
+        );
         let after = buffer.metrics().buffer_level_ms;
 
         assert_eq!(buffer.metrics().state, JitterState::Running);
@@ -849,105 +725,68 @@ mod tests {
         let metrics = buffer.metrics();
         assert!((metrics.audio_latency_ms - metrics.buffer_level_ms).abs() < 0.001);
         assert!((metrics.device_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
-        assert_eq!(metrics.correction_ppm, 0.0);
         assert!((metrics.effective_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
         assert!((metrics.resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
     }
 
     #[test]
-    fn integral_correction_accumulates_for_persistent_latency_error() {
+    fn fixed_delay_is_configurable() {
+        let t0 = Instant::now();
         let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 50,
-            target_ms: 50,
-            max_buffer_ms: 300,
-            kp: 0.0,
-            ki: 100.0,
-            error_filter_alpha: 1.0,
-            integral_limit_ms_sec: 20.0,
-            max_ppm: 1000.0,
-            emergency_max_ppm: 1000.0,
+            target_ms: 300,
+            fixed_delay_frames: 14_400,
             ..JitterConfig::default()
         });
-        for sequence in 0..100 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
-        }
+        buffer.insert_packet(packet(0, 0), t0);
 
         let mut out = vec![0.0; 240 * 2];
-        buffer.pull_f32(&mut out);
-        assert_eq!(buffer.metrics().state, JitterState::Running);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            SAMPLE_RATE,
+            t0 + Duration::from_millis(290),
+        );
+        assert!(out.iter().all(|sample| *sample == 0.0));
 
-        for sequence in 100..120 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
-        }
-        for _ in 0..10 {
-            buffer.pull_f32(&mut out);
-        }
-
-        let metrics = buffer.metrics();
-        assert!(metrics.buffer_error_ms > 0.0);
-        assert!(metrics.integral_correction_ppm > 0.0);
-        assert!(metrics.correction_ppm > 0.0);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            SAMPLE_RATE,
+            t0 + Duration::from_millis(300),
+        );
+        assert!(out.iter().any(|sample| *sample != 0.0));
     }
 
     #[test]
-    fn trims_back_to_target_when_latency_grows_too_large() {
+    fn fixed_delay_resample_phase_survives_renderer_timing_jitter() {
+        let t0 = Instant::now();
         let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 50,
             target_ms: 100,
-            max_buffer_ms: 150,
-            adaptive_resampling: false,
+            fixed_delay_frames: 4_800,
             ..JitterConfig::default()
         });
         for sequence in 0..200 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), t0);
         }
 
-        let mut out = vec![0.0; 240 * 2];
-        buffer.pull_f32(&mut out);
+        let mut out = vec![0.0; 441 * 2];
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            44_100,
+            t0 + Duration::from_millis(100),
+        );
         assert_eq!(buffer.metrics().state, JitterState::Running);
+        let after_first_pull = buffer.read_pos;
 
-        for sequence in 200..260 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
-        }
-        assert!(buffer.metrics().buffer_level_ms > 150.0);
+        buffer.pull_f32_at_sample_rate_for_playout(
+            &mut out,
+            44_100,
+            t0 + Duration::from_millis(120),
+        );
+        let consumed_by_second_pull = buffer.read_pos - after_first_pull;
 
-        buffer.pull_f32(&mut out);
+        assert!((after_first_pull - 480.0).abs() < 0.5);
+        assert!((consumed_by_second_pull - 480.0).abs() < 0.5);
         let metrics = buffer.metrics();
-        assert_eq!(metrics.latency_trims, 1);
-        assert!(metrics.trimmed_frames > 0);
-        assert!(metrics.buffer_level_ms <= 110.0);
-    }
-
-    #[test]
-    fn low_latency_mode_trims_before_max_buffer() {
-        let mut buffer = JitterBuffer::new(JitterConfig {
-            start_threshold_ms: 30,
-            target_ms: 30,
-            max_buffer_ms: 120,
-            low_latency: true,
-            low_latency_trim_margin_ms: 10,
-            low_latency_trim_to_margin_ms: 10,
-            trim_crossfade_ms: 0.0,
-            adaptive_resampling: false,
-            ..JitterConfig::default()
-        });
-        for sequence in 0..20 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
-        }
-
-        let mut out = vec![0.0; 120 * 2];
-        buffer.pull_f32(&mut out);
-        assert_eq!(buffer.metrics().state, JitterState::Running);
-
-        for sequence in 20..32 {
-            buffer.insert_packet(packet(sequence, sequence as u64 * 240), Instant::now());
-        }
-        assert!(buffer.metrics().buffer_level_ms > 40.0);
-        assert!(buffer.metrics().buffer_level_ms < 120.0);
-
-        buffer.pull_f32(&mut out);
-        let metrics = buffer.metrics();
-        assert_eq!(metrics.latency_trims, 1);
-        assert!(metrics.buffer_level_ms <= 45.0);
+        assert!((metrics.device_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
+        assert!((metrics.effective_resample_ratio - (48_000.0 / 44_100.0)).abs() < 0.0001);
     }
 }

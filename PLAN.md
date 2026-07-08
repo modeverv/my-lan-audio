@@ -1234,7 +1234,7 @@ sender --log-level debug
 receiver \
   --listen 0.0.0.0:50000 \
   --output-device "BlackHole" \
-  --target-buffer-ms 100
+  --fixed-delay-frames 14400
 ```
 
 補助コマンド:
@@ -1242,8 +1242,8 @@ receiver \
 ```bash
 receiver --list-devices
 receiver --log-level debug
-receiver --target-buffer-ms 50
-receiver --target-buffer-ms 200
+receiver --fixed-delay-frames 9600
+receiver --fixed-latency-ms 300
 ```
 
 ---
@@ -2469,7 +2469,7 @@ sender \
 receiver \
   --listen 0.0.0.0:50000 \
   --output-device "BlackHole" \
-  --target-buffer-ms 100
+  --fixed-delay-frames 14400
 ```
 
 WAV保存:

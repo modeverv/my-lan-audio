@@ -5,11 +5,8 @@ param(
     [string]$Output = "audio",
     [string]$OutputDevice = "",
     [string]$OutputFile = "",
-    [ValidateSet("normal", "low", "fixed-200ms", "fixed-500ms")]
-    [string]$LatencyMode = "fixed-200ms",
-    [int]$TargetBufferMs = 200,
-    [int]$StartThresholdMs = 200,
-    [int]$MaxBufferMs = 250,
+    [long]$FixedDelayFrames = 14400,
+    [int]$FixedLatencyMs = 0,
     [int]$OutputRingMs = 60,
     [int]$OutputRingCapacityMs = 160,
     [int]$RenderChunkMs = 2,
@@ -37,10 +34,6 @@ if ($ListDevices) {
     $cargoArgs += @(
         "--listen", $Listen,
         "--output", $Output,
-        "--latency-mode", $LatencyMode,
-        "--target-buffer-ms", ([string]$TargetBufferMs),
-        "--start-threshold-ms", ([string]$StartThresholdMs),
-        "--max-buffer-ms", ([string]$MaxBufferMs),
         "--output-ring-ms", ([string]$OutputRingMs),
         "--output-ring-capacity-ms", ([string]$OutputRingCapacityMs),
         "--render-chunk-ms", ([string]$RenderChunkMs),
@@ -49,6 +42,11 @@ if ($ListDevices) {
 
     if ($FeedbackTarget) {
         $cargoArgs += @("--feedback-target", $FeedbackTarget)
+    }
+    if ($FixedDelayFrames -gt 0) {
+        $cargoArgs += @("--fixed-delay-frames", ([string]$FixedDelayFrames))
+    } elseif ($FixedLatencyMs -gt 0) {
+        $cargoArgs += @("--fixed-latency-ms", ([string]$FixedLatencyMs))
     }
     if ($OutputDevice) {
         $cargoArgs += @("--output-device", $OutputDevice)
