@@ -2,7 +2,7 @@ mod audio_ring;
 
 use anyhow::{anyhow, bail, Context, Result};
 use audio_ring::SpscF32Ring;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
@@ -20,6 +20,28 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const FIXED_LATENCY_MS: u32 = 500;
+const FIXED_LATENCY_MAX_BUFFER_MS: u32 = 550;
+const FIXED_LATENCY_CAPACITY_MS: u32 = 1500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LatencyMode {
+    Normal,
+    Low,
+    #[value(name = "fixed-500ms", alias = "fixed500")]
+    Fixed500Ms,
+}
+
+impl LatencyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Low => "low",
+            Self::Fixed500Ms => "fixed-500ms",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP receiver")]
@@ -84,7 +106,15 @@ struct Args {
     #[arg(long)]
     no_adaptive_resampling: bool,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "normal",
+        help = "Receiver latency profile"
+    )]
+    latency_mode: LatencyMode,
+
+    #[arg(long, help = "Alias for --latency-mode low")]
     low_latency: bool,
 
     #[arg(long, default_value_t = 10)]
@@ -129,7 +159,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    validate_audio_args(&args)?;
+    let timing = ReceiverTiming::from_args(&args)?;
+    validate_audio_args(&args, &timing)?;
 
     if args.list_devices {
         return list_output_devices();
@@ -139,20 +170,101 @@ fn main() -> Result<()> {
         return run_test_tone(&args);
     }
 
-    run_receiver(&args)
+    run_receiver(&args, timing)
 }
 
-fn validate_audio_args(args: &Args) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+struct ReceiverTiming {
+    latency_mode: LatencyMode,
+    capacity_ms: u32,
+    target_buffer_ms: u32,
+    max_buffer_ms: u32,
+    start_threshold_ms: u32,
+    low_latency: bool,
+    low_latency_trim_margin_ms: u32,
+    low_latency_trim_to_margin_ms: u32,
+    output_ring_ms: u32,
+    output_ring_capacity_ms: u32,
+    render_chunk_ms: u32,
+    realtime_renderer: bool,
+    output_buffer_size_frames: Option<u32>,
+}
+
+impl ReceiverTiming {
+    fn from_args(args: &Args) -> Result<Self> {
+        if args.low_latency && args.latency_mode != LatencyMode::Normal {
+            bail!("--low-latency cannot be combined with --latency-mode");
+        }
+
+        let latency_mode = if args.low_latency {
+            LatencyMode::Low
+        } else {
+            args.latency_mode
+        };
+
+        let timing = match latency_mode {
+            LatencyMode::Normal => Self {
+                latency_mode,
+                capacity_ms: args.capacity_ms,
+                target_buffer_ms: args.target_buffer_ms,
+                max_buffer_ms: args.max_buffer_ms,
+                start_threshold_ms: args.start_threshold_ms,
+                low_latency: false,
+                low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
+                low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
+                output_ring_ms: args.output_ring_ms,
+                output_ring_capacity_ms: args.output_ring_capacity_ms,
+                render_chunk_ms: args.render_chunk_ms,
+                realtime_renderer: args.realtime_renderer,
+                output_buffer_size_frames: args.output_buffer_size_frames,
+            },
+            LatencyMode::Low => Self {
+                latency_mode,
+                capacity_ms: args.capacity_ms,
+                target_buffer_ms: args.target_buffer_ms,
+                max_buffer_ms: args.max_buffer_ms,
+                start_threshold_ms: args.start_threshold_ms,
+                low_latency: true,
+                low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
+                low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
+                output_ring_ms: args.output_ring_ms,
+                output_ring_capacity_ms: args.output_ring_capacity_ms,
+                render_chunk_ms: args.render_chunk_ms,
+                realtime_renderer: true,
+                output_buffer_size_frames: args.output_buffer_size_frames,
+            },
+            LatencyMode::Fixed500Ms => Self {
+                latency_mode,
+                capacity_ms: args.capacity_ms.max(FIXED_LATENCY_CAPACITY_MS),
+                target_buffer_ms: FIXED_LATENCY_MS,
+                max_buffer_ms: FIXED_LATENCY_MAX_BUFFER_MS,
+                start_threshold_ms: FIXED_LATENCY_MS,
+                low_latency: false,
+                low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
+                low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
+                output_ring_ms: args.output_ring_ms,
+                output_ring_capacity_ms: args.output_ring_capacity_ms,
+                render_chunk_ms: args.render_chunk_ms,
+                realtime_renderer: args.realtime_renderer,
+                output_buffer_size_frames: args.output_buffer_size_frames,
+            },
+        };
+
+        Ok(timing)
+    }
+}
+
+fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
     if args.sample_rate != SAMPLE_RATE {
         bail!("only 48000Hz packets are supported today");
     }
     if args.channels != CHANNELS {
         bail!("only stereo packets are supported today");
     }
-    if args.target_buffer_ms == 0 || args.start_threshold_ms == 0 {
+    if timing.target_buffer_ms == 0 || timing.start_threshold_ms == 0 {
         bail!("buffer timing values must be greater than zero");
     }
-    if args.max_buffer_ms <= args.target_buffer_ms {
+    if timing.max_buffer_ms <= timing.target_buffer_ms {
         bail!("--max-buffer-ms must be greater than --target-buffer-ms");
     }
     if args.kp < 0.0 || args.ki < 0.0 {
@@ -167,19 +279,22 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.output_buffer_size_frames == Some(0) {
         bail!("--output-buffer-size-frames must be greater than zero");
     }
-    if args.low_latency_trim_margin_ms == 0 {
+    if timing.low_latency && timing.low_latency_trim_margin_ms == 0 {
         bail!("--low-latency-trim-margin-ms must be greater than zero");
     }
-    if args.low_latency_trim_to_margin_ms > args.low_latency_trim_margin_ms {
+    if timing.low_latency_trim_to_margin_ms > timing.low_latency_trim_margin_ms {
         bail!("--low-latency-trim-to-margin-ms must be less than or equal to --low-latency-trim-margin-ms");
     }
     if args.trim_crossfade_ms < 0.0 {
         bail!("--trim-crossfade-ms must be zero or greater");
     }
-    if args.output_ring_ms == 0 || args.output_ring_capacity_ms == 0 || args.render_chunk_ms == 0 {
+    if timing.output_ring_ms == 0
+        || timing.output_ring_capacity_ms == 0
+        || timing.render_chunk_ms == 0
+    {
         bail!("output ring and render chunk timing values must be greater than zero");
     }
-    if args.output_ring_capacity_ms < args.output_ring_ms + args.render_chunk_ms {
+    if timing.output_ring_capacity_ms < timing.output_ring_ms + timing.render_chunk_ms {
         bail!("--output-ring-capacity-ms must be at least --output-ring-ms + --render-chunk-ms");
     }
     if args.packet_queue_capacity == 0 {
@@ -188,23 +303,25 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn run_receiver(args: &Args) -> Result<()> {
+fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
     let socket = bind_socket(args.listen, args.socket_recv_buffer_bytes)?;
     println!(
-        "receiver: listening={} output={} output_file={:?} target_buffer={}ms",
+        "receiver: listening={} output={} output_file={:?} latency_mode={} target_buffer={}ms max_buffer={}ms",
         args.listen,
         output_mode(args),
         args.output_file,
-        args.target_buffer_ms
+        timing.latency_mode.as_str(),
+        timing.target_buffer_ms,
+        timing.max_buffer_ms
     );
 
     let jitter_config = JitterConfig {
         sample_rate: args.sample_rate,
         channels: args.channels,
-        capacity_ms: args.capacity_ms,
-        target_ms: args.target_buffer_ms,
-        max_buffer_ms: args.max_buffer_ms,
-        start_threshold_ms: args.start_threshold_ms,
+        capacity_ms: timing.capacity_ms,
+        target_ms: timing.target_buffer_ms,
+        max_buffer_ms: timing.max_buffer_ms,
+        start_threshold_ms: timing.start_threshold_ms,
         adaptive_resampling: !args.no_adaptive_resampling,
         kp: args.kp,
         ki: args.ki,
@@ -212,20 +329,21 @@ fn run_receiver(args: &Args) -> Result<()> {
         integral_limit_ms_sec: args.integral_limit_ms_sec,
         max_ppm: args.max_ppm,
         emergency_max_ppm: args.emergency_max_ppm,
-        low_latency: args.low_latency,
-        low_latency_trim_margin_ms: args.low_latency_trim_margin_ms,
-        low_latency_trim_to_margin_ms: args.low_latency_trim_to_margin_ms,
+        low_latency: timing.low_latency,
+        low_latency_trim_margin_ms: timing.low_latency_trim_margin_ms,
+        low_latency_trim_to_margin_ms: timing.low_latency_trim_to_margin_ms,
         trim_crossfade_ms: args.trim_crossfade_ms,
     };
     let (event_tx, event_rx) = sync_channel(args.packet_queue_capacity);
     let ingress_metrics = Arc::new(IngressMetrics::default());
-    let receiver_state = Arc::new(ReceiverState::new(args.target_buffer_ms));
+    let receiver_state = Arc::new(ReceiverState::new(timing.target_buffer_ms));
 
     spawn_udp_receiver(socket, event_tx, Arc::clone(&ingress_metrics));
 
     match output_mode(args).as_str() {
         "audio" => run_audio_output(
             args,
+            timing,
             jitter_config,
             event_rx,
             receiver_state,
@@ -475,6 +593,7 @@ fn run_timed_pull_output(
 
 fn run_audio_output(
     args: &Args,
+    timing: ReceiverTiming,
     jitter_config: JitterConfig,
     event_rx: Receiver<ReceiverEvent>,
     receiver_state: Arc<ReceiverState>,
@@ -489,7 +608,7 @@ fn run_audio_output(
     let sample_format = supported.sample_format();
     let mut config = supported.config();
     config.channels = args.channels;
-    if let Some(frames) = args.output_buffer_size_frames {
+    if let Some(frames) = timing.output_buffer_size_frames {
         config.buffer_size = BufferSize::Fixed(frames);
     }
 
@@ -500,7 +619,7 @@ fn run_audio_output(
 
     let channels = usize::from(config.channels.max(1));
     let ring_capacity_samples =
-        samples_from_ms(config.sample_rate, channels, args.output_ring_capacity_ms);
+        samples_from_ms(config.sample_rate, channels, timing.output_ring_capacity_ms);
     let ring = Arc::new(SpscF32Ring::new(ring_capacity_samples));
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
     spawn_ring_renderer(
@@ -512,10 +631,10 @@ fn run_audio_output(
         RingRendererConfig {
             output_sample_rate: config.sample_rate,
             channels,
-            output_ring_ms: args.output_ring_ms,
-            render_chunk_ms: args.render_chunk_ms,
-            low_latency: args.low_latency,
-            realtime_priority: args.low_latency || args.realtime_renderer,
+            output_ring_ms: timing.output_ring_ms,
+            render_chunk_ms: timing.render_chunk_ms,
+            low_latency: timing.low_latency,
+            realtime_priority: timing.low_latency || timing.realtime_renderer,
         },
     );
     let stream = build_ring_output_stream(
@@ -1252,5 +1371,92 @@ fn sleep_until(deadline: Instant) {
     let now = Instant::now();
     if deadline > now {
         thread::sleep(deadline - now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_args() -> Args {
+        Args {
+            listen: "0.0.0.0:50000".parse().unwrap(),
+            feedback_target: None,
+            output: "null".to_string(),
+            output_device: None,
+            output_file: None,
+            list_devices: false,
+            test_tone: false,
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            capacity_ms: 1000,
+            target_buffer_ms: 100,
+            max_buffer_ms: 300,
+            start_threshold_ms: 100,
+            kp: 5.0,
+            ki: 0.2,
+            error_filter_alpha: 0.05,
+            integral_limit_ms_sec: 1000.0,
+            max_ppm: 1000.0,
+            emergency_max_ppm: 5000.0,
+            no_adaptive_resampling: false,
+            latency_mode: LatencyMode::Normal,
+            low_latency: false,
+            low_latency_trim_margin_ms: 10,
+            low_latency_trim_to_margin_ms: 10,
+            trim_crossfade_ms: 1.5,
+            realtime_renderer: false,
+            output_buffer_size_frames: None,
+            output_ring_ms: 40,
+            output_ring_capacity_ms: 200,
+            render_chunk_ms: 5,
+            socket_recv_buffer_bytes: 1_048_576,
+            packet_queue_capacity: 2048,
+            duration_sec: None,
+            metrics_interval_sec: 1.0,
+            freq: 440.0,
+        }
+    }
+
+    #[test]
+    fn fixed_500ms_mode_overrides_jitter_buffer_timing() {
+        let mut args = default_args();
+        args.latency_mode = LatencyMode::Fixed500Ms;
+        args.capacity_ms = 1000;
+        args.target_buffer_ms = 20;
+        args.start_threshold_ms = 20;
+        args.max_buffer_ms = 60;
+        args.low_latency = false;
+
+        let timing = ReceiverTiming::from_args(&args).unwrap();
+
+        assert_eq!(timing.latency_mode, LatencyMode::Fixed500Ms);
+        assert_eq!(timing.capacity_ms, FIXED_LATENCY_CAPACITY_MS);
+        assert_eq!(timing.target_buffer_ms, FIXED_LATENCY_MS);
+        assert_eq!(timing.start_threshold_ms, FIXED_LATENCY_MS);
+        assert_eq!(timing.max_buffer_ms, FIXED_LATENCY_MAX_BUFFER_MS);
+        assert!(!timing.low_latency);
+        validate_audio_args(&args, &timing).unwrap();
+    }
+
+    #[test]
+    fn low_latency_flag_still_selects_low_latency_mode() {
+        let mut args = default_args();
+        args.low_latency = true;
+
+        let timing = ReceiverTiming::from_args(&args).unwrap();
+
+        assert_eq!(timing.latency_mode, LatencyMode::Low);
+        assert!(timing.low_latency);
+        assert!(timing.realtime_renderer);
+    }
+
+    #[test]
+    fn low_latency_flag_cannot_be_combined_with_explicit_mode() {
+        let mut args = default_args();
+        args.low_latency = true;
+        args.latency_mode = LatencyMode::Fixed500Ms;
+
+        assert!(ReceiverTiming::from_args(&args).is_err());
     }
 }
