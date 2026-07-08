@@ -23,16 +23,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const FIXED_LATENCY_MS: u32 = 500;
-const FIXED_LATENCY_MAX_BUFFER_MS: u32 = 550;
-const FIXED_LATENCY_CAPACITY_MS: u32 = 1500;
+const FIXED_LATENCY_MS: u32 = 200;
+const FIXED_LATENCY_MAX_BUFFER_MS: u32 = 250;
+const FIXED_LATENCY_CAPACITY_MS: u32 = 600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum LatencyMode {
     Normal,
     Low,
-    #[value(name = "fixed-500ms", alias = "fixed500")]
-    Fixed500Ms,
+    #[value(
+        name = "fixed-200ms",
+        alias = "fixed200",
+        alias = "fixed-500ms",
+        alias = "fixed500"
+    )]
+    Fixed200Ms,
 }
 
 impl LatencyMode {
@@ -40,7 +45,7 @@ impl LatencyMode {
         match self {
             Self::Normal => "normal",
             Self::Low => "low",
-            Self::Fixed500Ms => "fixed-500ms",
+            Self::Fixed200Ms => "fixed-200ms",
         }
     }
 }
@@ -235,7 +240,7 @@ impl ReceiverTiming {
                 realtime_renderer: true,
                 output_buffer_size_frames: args.output_buffer_size_frames,
             },
-            LatencyMode::Fixed500Ms => Self {
+            LatencyMode::Fixed200Ms => Self {
                 latency_mode,
                 capacity_ms: args.capacity_ms.max(FIXED_LATENCY_CAPACITY_MS),
                 target_buffer_ms: FIXED_LATENCY_MS,
@@ -1399,10 +1404,10 @@ mod tests {
     }
 
     #[test]
-    fn fixed_500ms_mode_overrides_jitter_buffer_timing() {
+    fn fixed_200ms_mode_overrides_jitter_buffer_timing() {
         let mut args = default_args();
-        args.latency_mode = LatencyMode::Fixed500Ms;
-        args.capacity_ms = 1000;
+        args.latency_mode = LatencyMode::Fixed200Ms;
+        args.capacity_ms = 100;
         args.target_buffer_ms = 20;
         args.start_threshold_ms = 20;
         args.max_buffer_ms = 60;
@@ -1410,13 +1415,23 @@ mod tests {
 
         let timing = ReceiverTiming::from_args(&args).unwrap();
 
-        assert_eq!(timing.latency_mode, LatencyMode::Fixed500Ms);
+        assert_eq!(timing.latency_mode, LatencyMode::Fixed200Ms);
         assert_eq!(timing.capacity_ms, FIXED_LATENCY_CAPACITY_MS);
         assert_eq!(timing.target_buffer_ms, FIXED_LATENCY_MS);
         assert_eq!(timing.start_threshold_ms, FIXED_LATENCY_MS);
         assert_eq!(timing.max_buffer_ms, FIXED_LATENCY_MAX_BUFFER_MS);
         assert!(!timing.low_latency);
         validate_audio_args(&args, &timing).unwrap();
+    }
+
+    #[test]
+    fn fixed_latency_mode_accepts_current_name_and_old_alias() {
+        let current = Args::try_parse_from(["receiver", "--latency-mode", "fixed-200ms"]).unwrap();
+        assert_eq!(current.latency_mode, LatencyMode::Fixed200Ms);
+
+        let old_alias =
+            Args::try_parse_from(["receiver", "--latency-mode", "fixed-500ms"]).unwrap();
+        assert_eq!(old_alias.latency_mode, LatencyMode::Fixed200Ms);
     }
 
     #[test]
@@ -1435,7 +1450,7 @@ mod tests {
     fn low_latency_flag_cannot_be_combined_with_explicit_mode() {
         let mut args = default_args();
         args.low_latency = true;
-        args.latency_mode = LatencyMode::Fixed500Ms;
+        args.latency_mode = LatencyMode::Fixed200Ms;
 
         assert!(ReceiverTiming::from_args(&args).is_err());
     }

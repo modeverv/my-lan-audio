@@ -11,10 +11,10 @@ W_FEEDBACK_ADDR ?= 0.0.0.0:50001
 RECEIVER_OUTPUT_DEVICE ?= BlackHole 2ch
 SENDER_INPUT_DEVICE ?= BlackHole 2ch
 
-RECEIVER_LATENCY_MODE ?= fixed-500ms
-TARGET_BUFFER_MS ?= 500
-START_THRESHOLD_MS ?= 500
-MAX_BUFFER_MS ?= 550
+RECEIVER_LATENCY_MODE ?= fixed-200ms
+TARGET_BUFFER_MS ?= 200
+START_THRESHOLD_MS ?= 200
+MAX_BUFFER_MS ?= 250
 
 OUTPUT_RING_MS ?= 60
 OUTPUT_RING_CAPACITY_MS ?= 160
@@ -25,15 +25,15 @@ METRICS_INTERVAL_SEC ?= 1
 
 help:
 	@printf '%s\n' 'Targets:'
-	@printf '%s\n' '  make receiver          Start receiver with fixed 500ms latency settings'
+	@printf '%s\n' '  make receiver          Start receiver with fixed 200ms latency settings'
 	@printf '%s\n' '  make receive           Alias for make receiver'
 	@printf '%s\n' '  make sender            Start capture sender with feedback enabled'
-	@printf '%s\n' '  make fixed-receiver    Start receiver with explicit fixed 500ms latency settings'
-	@printf '%s\n' '  make fixed-sender      Start sender with explicit fixed 500ms mode packet settings'
+	@printf '%s\n' '  make fixed-receiver    Start receiver with explicit fixed 200ms latency settings'
+	@printf '%s\n' '  make fixed-sender      Start sender with explicit fixed 200ms mode packet settings'
 	@printf '%s\n' '  make p-receiver        Start release receiver with feedback enabled'
 	@printf '%s\n' '  make p-sender          Start release sender with feedback enabled'
-	@printf '%s\n' '  make p-fixed-receiver  Start release receiver with explicit fixed 500ms latency settings'
-	@printf '%s\n' '  make p-fixed-sender    Start release sender with explicit fixed 500ms mode packet settings'
+	@printf '%s\n' '  make p-fixed-receiver  Start release receiver with explicit fixed 200ms latency settings'
+	@printf '%s\n' '  make p-fixed-sender    Start release sender with explicit fixed 200ms mode packet settings'
 	@printf '%s\n' '  make release           Build release binaries'
 	@printf '%s\n' '  make receiver-devices  List receiver output devices'
 	@printf '%s\n' '  make sender-devices    List sender input devices'
@@ -68,10 +68,10 @@ receiver:
 
 receive: receiver
 
-fixed-receiver: RECEIVER_LATENCY_MODE := fixed-500ms
-fixed-receiver: TARGET_BUFFER_MS := 500
-fixed-receiver: START_THRESHOLD_MS := 500
-fixed-receiver: MAX_BUFFER_MS := 550
+fixed-receiver: RECEIVER_LATENCY_MODE := fixed-200ms
+fixed-receiver: TARGET_BUFFER_MS := 200
+fixed-receiver: START_THRESHOLD_MS := 200
+fixed-receiver: MAX_BUFFER_MS := 250
 fixed-receiver: OUTPUT_RING_MS := 60
 fixed-receiver: OUTPUT_RING_CAPACITY_MS := 160
 fixed-receiver: RENDER_CHUNK_MS := 2
@@ -113,10 +113,10 @@ p-receiver:
 	  --render-chunk-ms $(RENDER_CHUNK_MS) \
 	  --metrics-interval-sec $(METRICS_INTERVAL_SEC)
 
-p-fixed-receiver: RECEIVER_LATENCY_MODE := fixed-500ms
-p-fixed-receiver: TARGET_BUFFER_MS := 500
-p-fixed-receiver: START_THRESHOLD_MS := 500
-p-fixed-receiver: MAX_BUFFER_MS := 550
+p-fixed-receiver: RECEIVER_LATENCY_MODE := fixed-200ms
+p-fixed-receiver: TARGET_BUFFER_MS := 200
+p-fixed-receiver: START_THRESHOLD_MS := 200
+p-fixed-receiver: MAX_BUFFER_MS := 250
 p-fixed-receiver: OUTPUT_RING_MS := 60
 p-fixed-receiver: OUTPUT_RING_CAPACITY_MS := 160
 p-fixed-receiver: RENDER_CHUNK_MS := 2

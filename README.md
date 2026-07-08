@@ -19,7 +19,7 @@
 - receiver-side output resampling: output device が 44.1 kHz / 48 kHz どちらでも出力
 - jitter buffer, loss / late / duplicate / out-of-order metrics
 - receiver-only adaptive resampling with PI correction
-- receiver latency mode: `normal`, `low`, `fixed-500ms`
+- receiver latency mode: `normal`, `low`, `fixed-200ms`
 - receiver -> sender feedback status UDP
 - receiver audio callback は SPSC ring 読み取り専用
 - `JitterBuffer` は renderer / timed output 側が単独所有し、audio callback や UDP receive thread と `Mutex<JitterBuffer>` を共有しない
@@ -258,9 +258,9 @@ mise exec -- cargo run -p sender -- \
 - システム出力を BlackHole にすると、通常のスピーカーからは直接音が出なくなります。このアプリの receiver がスピーカーへ戻す役割になります。
 - feedback port は audio port と別です。上の例では audio が `50000`, feedback が `50001` です。
 
-### 固定 500ms Makefile shortcut
+### 固定 200ms Makefile shortcut
 
-localhost で固定 500ms 設定を試す場合は、receiver を先に起動してから sender を起動します。Makefile の既定値は、receiver の jitter buffer を `500ms` に固定し、映像側で別途遅延補正しやすい安定寄りの設定です。
+localhost で固定 200ms 設定を試す場合は、receiver を先に起動してから sender を起動します。Makefile の既定値は、receiver の jitter buffer を `200ms` に固定し、映像側で別途遅延補正しやすい安定寄りの設定です。
 
 Terminal 1:
 
@@ -283,9 +283,9 @@ receiver output device: MacBook Proのスピーカー
 sender input device: BlackHole 2ch
 audio: 127.0.0.1:50000
 feedback: 127.0.0.1:50001
-receiver latency mode: fixed-500ms
-target-buffer-ms: 500
-max-buffer-ms: 550
+receiver latency mode: fixed-200ms
+target-buffer-ms: 200
+max-buffer-ms: 250
 output-ring-ms: 60
 output-buffer-size-frames: 256
 packet-ms: 5
@@ -523,7 +523,7 @@ mise exec -- cargo run -p receiver -- \
   --output-device "BlackHole"
 ```
 
-固定 500ms 設定:
+固定 200ms 設定:
 
 ```bash
 mise exec -- cargo run -p receiver -- \
@@ -531,13 +531,13 @@ mise exec -- cargo run -p receiver -- \
   --feedback-target <senderのLAN IP>:50001 \
   --output audio \
   --output-device "BlackHole" \
-  --latency-mode fixed-500ms \
+  --latency-mode fixed-200ms \
   --output-ring-ms 60 \
   --output-ring-capacity-ms 160 \
   --render-chunk-ms 2
 ```
 
-`fixed-500ms` は `target-buffer-ms=500`, `start-threshold-ms=500`, `max-buffer-ms=550`, `capacity-ms>=1500` として動作します。ログの `latency` / sender 側の `remote_latency` が 500ms 付近に寄ることを確認してください。実際に耳で感じる遅延には `outq` とデバイス側遅延も加わります。
+`fixed-200ms` は `target-buffer-ms=200`, `start-threshold-ms=200`, `max-buffer-ms=250`, `capacity-ms>=600` として動作します。ログの `latency` / sender 側の `remote_latency` が 200ms 付近に寄ることを確認してください。`fixed-500ms` は互換 alias として受け付けます。実際に耳で感じる遅延には `outq` とデバイス側遅延も加わります。
 
 低遅延寄りの localhost 設定例:
 
@@ -559,7 +559,7 @@ mise exec -- cargo run -p receiver -- \
   --render-chunk-ms 2
 ```
 
-低遅延設定では `--latency-mode low` が `target + low-latency-trim-margin-ms` を超えた buffer を積極的に trim します。これにより `target=20ms` なのに `latency=60ms` で安定してしまう状態を避けます。安定性優先のBGM用途では、`--latency-mode fixed-500ms` または `target-buffer-ms=80` 以上、`output-ring-ms=40` 以上へ戻してください。
+低遅延設定では `--latency-mode low` が `target + low-latency-trim-margin-ms` を超えた buffer を積極的に trim します。これにより `target=20ms` なのに `latency=60ms` で安定してしまう状態を避けます。安定性優先のBGM用途では、`--latency-mode fixed-200ms` または `target-buffer-ms=80` 以上、`output-ring-ms=40` 以上へ戻してください。
 
 主な receiver option:
 
@@ -573,7 +573,7 @@ mise exec -- cargo run -p receiver -- \
 --test-tone                             receiver単体でtest tone出力
 --sample-rate <HZ>                      packet sample rate。現在は48000のみ
 --channels <N>                          channel数。現在は2のみ
---latency-mode normal|low|fixed-500ms   receiver latency mode。default: normal
+--latency-mode normal|low|fixed-200ms   receiver latency mode。default: normal
 --capacity-ms <MS>                      jitter buffer容量。default: 1000
 --target-buffer-ms <MS>                 目標jitter buffer水位。default: 100
 --max-buffer-ms <MS>                    trim開始目安。default: 300
@@ -663,14 +663,14 @@ jitter buffer latency
 + capture device 側の遅延
 ```
 
-通常の CLI default は `target-buffer-ms=100` と `output-ring-ms=40` なので、従来の安定性優先設定です。Makefile の `make receiver` / `make sender` は現在、映像側で遅延補正する前提の固定 500ms モードを使います。
+通常の CLI default は `target-buffer-ms=100` と `output-ring-ms=40` なので、従来の安定性優先設定です。Makefile の `make receiver` / `make sender` は現在、映像側で遅延補正する前提の固定 200ms モードを使います。
 
-固定 500ms モードでは以下を目安にします。
+固定 200ms モードでは以下を目安にします。
 
 ```text
-latency / remote_latency ~= 500ms
+latency / remote_latency ~= 200ms
 outq / remote_outq ~= OUTPUT_RING_MS
-target = 500ms
+target = 200ms
 ```
 
 低遅延検証へ戻す場合は `make receiver RECEIVER_LATENCY_MODE=low TARGET_BUFFER_MS=20 START_THRESHOLD_MS=20 MAX_BUFFER_MS=60 OUTPUT_RING_MS=15 PACKET_MS=2.5` のように起動します。
@@ -691,7 +691,7 @@ channels: 2
 sample format: signed 16-bit little endian PCM
 default packet duration: 5 ms
 low-latency packet duration: 2.5 ms
-fixed-500ms packet duration: 5 ms
+fixed-200ms packet duration: 5 ms
 frames per packet: 240 at 5 ms, 120 at 2.5 ms
 payload bytes per packet: 960 at 5 ms, 480 at 2.5 ms
 nominal packet rate: 200 packets/s at 5 ms, 400 packets/s at 2.5 ms

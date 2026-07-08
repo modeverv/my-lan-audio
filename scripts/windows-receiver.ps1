@@ -5,11 +5,11 @@ param(
     [string]$Output = "audio",
     [string]$OutputDevice = "",
     [string]$OutputFile = "",
-    [ValidateSet("normal", "low", "fixed-500ms")]
-    [string]$LatencyMode = "fixed-500ms",
-    [int]$TargetBufferMs = 500,
-    [int]$StartThresholdMs = 500,
-    [int]$MaxBufferMs = 550,
+    [ValidateSet("normal", "low", "fixed-200ms", "fixed-500ms")]
+    [string]$LatencyMode = "fixed-200ms",
+    [int]$TargetBufferMs = 200,
+    [int]$StartThresholdMs = 200,
+    [int]$MaxBufferMs = 250,
     [int]$OutputRingMs = 60,
     [int]$OutputRingCapacityMs = 160,
     [int]$RenderChunkMs = 2,
