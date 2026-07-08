@@ -58,7 +58,7 @@ struct Args {
 
     #[arg(
         long,
-        help = "Enable fixed-delay playout scheduling with the given 48k source frame delay"
+        help = "Keep the receiver jitter buffer at the given 48k source-frame depth"
     )]
     fixed_delay_frames: Option<u64>,
 
@@ -760,13 +760,16 @@ fn spawn_ring_renderer(
                     let sample_count = frames_to_render * channels;
                     let scratch = &mut render_scratch[..sample_count];
 
-                    let queued_frames = queued / channels;
-                    let first_playout_at = Instant::now()
-                        + duration_from_frames(queued_frames, config.output_sample_rate);
-                    jitter.pull_f32_at_sample_rate_for_playout(
+                    let missing_frames_after_render =
+                        (missing_samples / channels).saturating_sub(frames_to_render);
+                    let buffered_after_pull_frames = ((missing_frames_after_render as f64
+                        * SAMPLE_RATE as f64)
+                        / config.output_sample_rate.max(1) as f64)
+                        .ceil() as u64;
+                    jitter.pull_f32_at_sample_rate_with_buffer_target(
                         scratch,
                         config.output_sample_rate,
-                        first_playout_at,
+                        buffered_after_pull_frames,
                     );
 
                     let pushed = ring.push_interleaved(scratch, channels);
@@ -837,10 +840,6 @@ where
 fn samples_from_ms(sample_rate: u32, channels: usize, ms: u32) -> usize {
     let channels = channels.max(1);
     ((sample_rate as usize * ms as usize / 1000).max(1)).saturating_mul(channels)
-}
-
-fn duration_from_frames(frames: usize, sample_rate: u32) -> Duration {
-    Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64)
 }
 
 fn scratch_len_for_stream(config: &StreamConfig) -> usize {
