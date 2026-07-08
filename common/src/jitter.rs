@@ -141,6 +141,7 @@ pub struct JitterBuffer {
     read_pos: f64,
     latest_received_end: u64,
     expected_sequence: Option<u32>,
+    i16_scratch: Vec<f32>,
     first_drift_sample: Option<u64>,
     first_drift_arrival: Option<Instant>,
     last_stream_arrival: Option<Instant>,
@@ -159,6 +160,7 @@ impl JitterBuffer {
             read_pos: 0.0,
             latest_received_end: 0,
             expected_sequence: None,
+            i16_scratch: Vec::new(),
             first_drift_sample: None,
             first_drift_arrival: None,
             last_stream_arrival: None,
@@ -290,16 +292,22 @@ impl JitterBuffer {
         playout_buffered_after_pull_frames: u64,
         playout_time: Option<Instant>,
     ) {
-        output.fill(0.0);
         if output.is_empty() || self.config.channels == 0 {
             return;
         }
 
         let channels = self.config.channels as usize;
+        let output_frames = output.len() / channels;
+        let rendered_samples = output_frames * channels;
+        let (output, trailing_output) = output.split_at_mut(rendered_samples);
+        trailing_output.fill(0.0);
+        if output_frames == 0 {
+            return;
+        }
+
         let output_sample_rate = output_sample_rate.max(1);
         let device_resample_ratio = self.config.sample_rate as f64 / output_sample_rate as f64;
 
-        let output_frames = output.len() / channels;
         let source_frames_to_render = source_frames_for_output_frames(
             output_frames,
             self.config.sample_rate,
@@ -323,6 +331,7 @@ impl JitterBuffer {
         let Some(correction_ppm) =
             self.prepare_fixed_buffer(required_before_pull, source_frames_to_render)
         else {
+            output.fill(0.0);
             if self.stream_id.is_some() {
                 self.metrics.startup_underruns += 1;
             }
@@ -343,39 +352,56 @@ impl JitterBuffer {
         let mut missing_in_call = 0u64;
         let mut consecutive_missing_frames = self.consecutive_missing_frames;
         let mut read_pos = self.read_pos;
+        let rounded_read_pos = read_pos.round();
+        let use_integer_fast_path = (effective_resample_ratio - 1.0).abs() < 1.0e-9
+            && (read_pos - rounded_read_pos).abs() < 1.0e-6;
 
         {
             let packets = &self.packets;
             let mut packet_cache = None;
-            for frame_out in output.chunks_exact_mut(channels) {
-                let pos0 = read_pos.floor().max(0.0) as u64;
-                let frac = (read_pos - pos0 as f64) as f32;
 
-                match (
-                    sample_at_cached(packets, channels, pos0, &mut packet_cache),
-                    sample_at_cached(packets, channels, pos0 + 1, &mut packet_cache),
-                ) {
-                    (Some(a), Some(b)) => {
-                        let frame = a.lerp(b, frac);
-                        frame_out[0] = frame.left;
-                        if channels > 1 {
-                            frame_out[1] = frame.right;
-                        }
+            if use_integer_fast_path {
+                read_pos = rounded_read_pos.max(0.0);
+                let mut position = read_pos as u64;
+                for frame_out in output.chunks_exact_mut(channels) {
+                    if let Some(frame) =
+                        sample_at_cached(packets, channels, position, &mut packet_cache)
+                    {
+                        write_frame(frame_out, frame);
                         consecutive_missing_frames = 0;
-                    }
-                    (Some(a), None) => {
-                        frame_out[0] = a.left;
-                        if channels > 1 {
-                            frame_out[1] = a.right;
-                        }
-                        consecutive_missing_frames = 0;
-                    }
-                    _ => {
+                    } else {
+                        write_silence_frame(frame_out);
                         missing_in_call += 1;
                         consecutive_missing_frames += 1;
                     }
+                    position = position.saturating_add(1);
+                    read_pos += 1.0;
                 }
-                read_pos += effective_resample_ratio;
+            } else {
+                for frame_out in output.chunks_exact_mut(channels) {
+                    let pos0 = read_pos.floor().max(0.0) as u64;
+                    let frac = (read_pos - pos0 as f64) as f32;
+
+                    match (
+                        sample_at_cached(packets, channels, pos0, &mut packet_cache),
+                        sample_at_cached(packets, channels, pos0 + 1, &mut packet_cache),
+                    ) {
+                        (Some(a), Some(b)) => {
+                            write_frame(frame_out, a.lerp(b, frac));
+                            consecutive_missing_frames = 0;
+                        }
+                        (Some(a), None) => {
+                            write_frame(frame_out, a);
+                            consecutive_missing_frames = 0;
+                        }
+                        _ => {
+                            write_silence_frame(frame_out);
+                            missing_in_call += 1;
+                            consecutive_missing_frames += 1;
+                        }
+                    }
+                    read_pos += effective_resample_ratio;
+                }
             }
         }
 
@@ -403,11 +429,21 @@ impl JitterBuffer {
     }
 
     pub fn pull_i16_at_sample_rate(&mut self, output: &mut [i16], output_sample_rate: u32) {
-        let mut tmp = vec![0.0f32; output.len()];
-        self.pull_f32_at_sample_rate(&mut tmp, output_sample_rate);
-        for (dst, src) in output.iter_mut().zip(tmp) {
+        if output.is_empty() {
+            return;
+        }
+        if self.config.channels == 0 {
+            output.fill(0);
+            return;
+        }
+
+        let mut scratch = std::mem::take(&mut self.i16_scratch);
+        scratch.resize(output.len(), 0.0);
+        self.pull_f32_at_sample_rate(&mut scratch, output_sample_rate);
+        for (dst, src) in output.iter_mut().zip(scratch.iter().copied()) {
             *dst = f32_to_i16(src);
         }
+        self.i16_scratch = scratch;
     }
 
     pub fn metrics(&self) -> JitterMetrics {
@@ -684,6 +720,22 @@ fn sample_at_cached<'a>(
     sample_from_packet(*start, packet, channels, position)
 }
 
+fn write_frame(output: &mut [f32], frame: StereoFrame) {
+    if let Some(left) = output.first_mut() {
+        *left = frame.left;
+    }
+    if output.len() > 1 {
+        output[1] = frame.right;
+    }
+    if output.len() > 2 {
+        output[2..].fill(0.0);
+    }
+}
+
+fn write_silence_frame(output: &mut [f32]) {
+    output.fill(0.0);
+}
+
 fn source_frames_for_output_frames(
     output_frames: usize,
     source_sample_rate: u32,
@@ -810,7 +862,7 @@ mod tests {
         });
         buffer.insert_packet(packet(0, 0), t0);
 
-        let mut out = vec![0.0; 240 * 2];
+        let mut out = vec![1.0; 240 * 2];
         buffer.pull_f32_at_sample_rate_for_playout(
             &mut out,
             SAMPLE_RATE,
@@ -819,10 +871,29 @@ mod tests {
 
         let metrics = buffer.metrics();
         assert_eq!(metrics.state, JitterState::Priming);
+        assert!(out.iter().all(|sample| *sample == 0.0));
         assert_eq!(metrics.startup_underruns, 1);
         assert_eq!(metrics.steady_underruns, 0);
         assert_eq!(metrics.output_underruns, 0);
         assert_eq!(metrics.effective_resample_ratio, 1.0);
+    }
+
+    #[test]
+    fn missing_frames_are_zeroed_without_prefilling_output() {
+        let t0 = Instant::now();
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            fixed_delay_frames: 478,
+            ..JitterConfig::default()
+        });
+        buffer.insert_packet(packet(0, 0), t0);
+        buffer.insert_packet(packet(2, 480), t0);
+
+        let mut out = vec![1.0; 4 * 2];
+        buffer.pull_f32_at_sample_rate_for_playout(&mut out, SAMPLE_RATE, t0);
+
+        assert!(out[..4].iter().any(|sample| *sample != 0.0));
+        assert_eq!(&out[4..], &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(buffer.metrics().missing_frames, 2);
     }
 
     #[test]
