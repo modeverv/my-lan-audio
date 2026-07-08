@@ -15,8 +15,8 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -102,6 +102,103 @@ struct SendStats {
 }
 
 type SharedReceiverStatus = Arc<Mutex<Option<ReceiverStatus>>>;
+
+const CAPTURE_SENDER_QUEUE_CAPACITY: usize = 4;
+const CAPTURE_MONITOR_QUEUE_CAPACITY: usize = 32;
+
+#[derive(Default, Clone, Copy)]
+struct CaptureQueueSnapshot {
+    dropped_chunks: u64,
+    dropped_frames: u64,
+    lock_misses: u64,
+}
+
+struct CaptureQueue {
+    capacity: usize,
+    chunks: Mutex<VecDeque<Vec<StereoFrame>>>,
+    ready: Condvar,
+    dropped_chunks: AtomicU64,
+    dropped_frames: AtomicU64,
+    lock_misses: AtomicU64,
+}
+
+impl CaptureQueue {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "capture queue capacity must be non-zero");
+        Self {
+            capacity,
+            chunks: Mutex::new(VecDeque::with_capacity(capacity)),
+            ready: Condvar::new(),
+            dropped_chunks: AtomicU64::new(0),
+            dropped_frames: AtomicU64::new(0),
+            lock_misses: AtomicU64::new(0),
+        }
+    }
+
+    fn push_realtime(&self, chunk: Vec<StereoFrame>) {
+        let Ok(mut chunks) = self.chunks.try_lock() else {
+            self.record_dropped_chunk_len(chunk.len());
+            self.lock_misses.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        while chunks.len() >= self.capacity {
+            if let Some(old) = chunks.pop_front() {
+                self.record_dropped_chunk_len(old.len());
+            }
+        }
+        chunks.push_back(chunk);
+        self.ready.notify_one();
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Option<Vec<StereoFrame>> {
+        let mut chunks = self.chunks.lock().ok()?;
+        if chunks.is_empty() {
+            let Ok((guard, result)) = self.ready.wait_timeout(chunks, timeout) else {
+                return None;
+            };
+            chunks = guard;
+            if result.timed_out() && chunks.is_empty() {
+                return None;
+            }
+        }
+        chunks.pop_front()
+    }
+
+    fn recv_latest_timeout(&self, timeout: Duration) -> Option<Vec<StereoFrame>> {
+        let mut chunks = self.chunks.lock().ok()?;
+        if chunks.is_empty() {
+            let Ok((guard, result)) = self.ready.wait_timeout(chunks, timeout) else {
+                return None;
+            };
+            chunks = guard;
+            if result.timed_out() && chunks.is_empty() {
+                return None;
+            }
+        }
+
+        let mut latest = chunks.pop_front()?;
+        while let Some(newer) = chunks.pop_front() {
+            self.record_dropped_chunk_len(latest.len());
+            latest = newer;
+        }
+        Some(latest)
+    }
+
+    fn snapshot(&self) -> CaptureQueueSnapshot {
+        CaptureQueueSnapshot {
+            dropped_chunks: self.dropped_chunks.load(Ordering::Relaxed),
+            dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
+            lock_misses: self.lock_misses.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_dropped_chunk_len(&self, frames: usize) {
+        self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+        self.dropped_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+    }
+}
 
 struct PacketSender {
     socket: UdpSocket,
@@ -211,16 +308,24 @@ struct MetricsPrinter {
     last_packets: u64,
     last_bytes: u64,
     remote_status: Option<SharedReceiverStatus>,
+    capture_queue: Option<Arc<CaptureQueue>>,
+    last_capture_queue: CaptureQueueSnapshot,
 }
 
 impl MetricsPrinter {
-    fn new(interval_sec: f64, remote_status: Option<SharedReceiverStatus>) -> Self {
+    fn new(
+        interval_sec: f64,
+        remote_status: Option<SharedReceiverStatus>,
+        capture_queue: Option<Arc<CaptureQueue>>,
+    ) -> Self {
         Self {
             interval: Duration::from_secs_f64(interval_sec.max(0.1)),
             last: Instant::now(),
             last_packets: 0,
             last_bytes: 0,
             remote_status,
+            capture_queue,
+            last_capture_queue: CaptureQueueSnapshot::default(),
         }
     }
 
@@ -240,9 +345,10 @@ impl MetricsPrinter {
         let packets = sender.stats.sent_packets - self.last_packets;
         let bytes = sender.stats.sent_bytes - self.last_bytes;
         let bitrate_mbps = bytes as f64 * 8.0 / elapsed / 1_000_000.0;
+        let capture_suffix = self.capture_suffix(elapsed);
         let remote_suffix = self.remote_suffix();
         println!(
-            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={} send_corr={:.1}ppm{}",
+            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB dropped={} errors={} send_corr={:.1}ppm{}{}",
             packets as f64 / elapsed,
             bitrate_mbps,
             sender.sequence,
@@ -253,12 +359,37 @@ impl MetricsPrinter {
             sender.stats.dropped_packets,
             sender.stats.send_errors,
             send_rate_ppm,
+            capture_suffix,
             remote_suffix
         );
 
         self.last = Instant::now();
         self.last_packets = sender.stats.sent_packets;
         self.last_bytes = sender.stats.sent_bytes;
+    }
+
+    fn capture_suffix(&mut self, elapsed: f64) -> String {
+        let Some(capture_queue) = &self.capture_queue else {
+            return String::new();
+        };
+        let snapshot = capture_queue.snapshot();
+        let dropped_chunks = snapshot
+            .dropped_chunks
+            .saturating_sub(self.last_capture_queue.dropped_chunks);
+        let dropped_frames = snapshot
+            .dropped_frames
+            .saturating_sub(self.last_capture_queue.dropped_frames);
+        let lock_misses = snapshot
+            .lock_misses
+            .saturating_sub(self.last_capture_queue.lock_misses);
+        self.last_capture_queue = snapshot;
+
+        format!(
+            " capture_qdrop={:.1}/s capture_qdrop_frames={:.0}/s capture_lock_miss={:.1}/s",
+            dropped_chunks as f64 / elapsed,
+            dropped_frames as f64 / elapsed,
+            lock_misses as f64 / elapsed
+        )
     }
 
     fn remote_suffix(&self) -> String {
@@ -405,7 +536,7 @@ fn run_generated_sender(
 ) -> Result<()> {
     let packet_frames = packet_frames(args)?;
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone());
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone(), None);
     let start = Instant::now();
     let mut next_tick = Instant::now();
     let mut phase = 0.0f32;
@@ -458,7 +589,7 @@ fn run_file_sender(
     }
 
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone());
+    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone(), None);
     let start = Instant::now();
     let mut next_tick = Instant::now();
     let mut cursor = 0usize;
@@ -505,7 +636,8 @@ fn run_file_sender(
 
 fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) -> Result<()> {
     let packet_frames = packet_frames(args)?;
-    let (stream, rx, source_rate) = open_capture_stream(args)?;
+    let (stream, capture_queue, source_rate) =
+        open_capture_stream(args, CAPTURE_SENDER_QUEUE_CAPACITY)?;
     stream.play().context("failed to start input stream")?;
 
     println!(
@@ -514,7 +646,11 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
     );
     let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
     let mut sender = PacketSender::new(args)?;
-    let mut metrics = MetricsPrinter::new(args.metrics_interval_sec, remote_status.clone());
+    let mut metrics = MetricsPrinter::new(
+        args.metrics_interval_sec,
+        remote_status.clone(),
+        Some(Arc::clone(&capture_queue)),
+    );
     let mut pending = Vec::new();
     let start = Instant::now();
     let mut latest_rms = (-120.0, -120.0);
@@ -525,8 +661,8 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
             return Ok(());
         }
 
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => {
+        match capture_queue.recv_latest_timeout(Duration::from_millis(100)) {
+            Some(chunk) => {
                 latest_rms = rms_db(&chunk);
                 let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
                 let effective_target_rate =
@@ -540,8 +676,7 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
                     sender.send_frames(&packet)?;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(err) => return Err(err).context("capture stream stopped"),
+            None => {}
         }
         let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
         let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
@@ -550,7 +685,8 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
 }
 
 fn run_capture_monitor(args: &Args) -> Result<()> {
-    let (stream, rx, source_rate) = open_capture_stream(args)?;
+    let (stream, capture_queue, source_rate) =
+        open_capture_stream(args, CAPTURE_MONITOR_QUEUE_CAPACITY)?;
     stream.play().context("failed to start input stream")?;
 
     let mut writer = if let Some(path) = &args.output_file {
@@ -580,8 +716,8 @@ fn run_capture_monitor(args: &Args) -> Result<()> {
             return Ok(());
         }
 
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => {
+        match capture_queue.recv_timeout(Duration::from_millis(100)) {
+            Some(chunk) => {
                 latest_rms = rms_db(&chunk);
                 let mut resampled = Vec::new();
                 resampler.push(&chunk, &mut resampled);
@@ -593,8 +729,7 @@ fn run_capture_monitor(args: &Args) -> Result<()> {
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(err) => return Err(err).context("capture stream stopped"),
+            None => {}
         }
 
         if last.elapsed() >= interval {
@@ -607,7 +742,10 @@ fn run_capture_monitor(args: &Args) -> Result<()> {
     }
 }
 
-fn open_capture_stream(args: &Args) -> Result<(Stream, Receiver<Vec<StereoFrame>>, u32)> {
+fn open_capture_stream(
+    args: &Args,
+    queue_capacity: usize,
+) -> Result<(Stream, Arc<CaptureQueue>, u32)> {
     let host = cpal::default_host();
     let device = select_input_device(&host, args.device.as_deref())?;
     let device_name = device.to_string();
@@ -618,15 +756,21 @@ fn open_capture_stream(args: &Args) -> Result<(Stream, Receiver<Vec<StereoFrame>
     let config = supported.config();
     let source_rate = config.sample_rate;
     let source_channels = config.channels as usize;
-    let (tx, rx) = sync_channel::<Vec<StereoFrame>>(32);
+    let capture_queue = Arc::new(CaptureQueue::new(queue_capacity));
 
     println!(
         "selected_device=\"{}\" input_format={}Hz/{}ch/{:?}",
         device_name, source_rate, source_channels, sample_format
     );
 
-    let stream = build_input_stream(&device, sample_format, &config, source_channels, tx)?;
-    Ok((stream, rx, source_rate))
+    let stream = build_input_stream(
+        &device,
+        sample_format,
+        &config,
+        source_channels,
+        Arc::clone(&capture_queue),
+    )?;
+    Ok((stream, capture_queue, source_rate))
 }
 
 fn build_input_stream(
@@ -634,21 +778,41 @@ fn build_input_stream(
     sample_format: SampleFormat,
     config: &StreamConfig,
     channels: usize,
-    tx: SyncSender<Vec<StereoFrame>>,
+    capture_queue: Arc<CaptureQueue>,
 ) -> Result<Stream> {
     let stream = match sample_format {
-        SampleFormat::I8 => build_input_stream_for::<i8>(device, config, channels, tx)?,
-        SampleFormat::I16 => build_input_stream_for::<i16>(device, config, channels, tx)?,
-        SampleFormat::I24 => build_input_stream_for::<I24>(device, config, channels, tx)?,
-        SampleFormat::I32 => build_input_stream_for::<i32>(device, config, channels, tx)?,
-        SampleFormat::I64 => build_input_stream_for::<i64>(device, config, channels, tx)?,
-        SampleFormat::U8 => build_input_stream_for::<u8>(device, config, channels, tx)?,
-        SampleFormat::U16 => build_input_stream_for::<u16>(device, config, channels, tx)?,
-        SampleFormat::U24 => build_input_stream_for::<U24>(device, config, channels, tx)?,
-        SampleFormat::U32 => build_input_stream_for::<u32>(device, config, channels, tx)?,
-        SampleFormat::U64 => build_input_stream_for::<u64>(device, config, channels, tx)?,
-        SampleFormat::F32 => build_input_stream_for::<f32>(device, config, channels, tx)?,
-        SampleFormat::F64 => build_input_stream_for::<f64>(device, config, channels, tx)?,
+        SampleFormat::I8 => build_input_stream_for::<i8>(device, config, channels, capture_queue)?,
+        SampleFormat::I16 => {
+            build_input_stream_for::<i16>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::I24 => {
+            build_input_stream_for::<I24>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::I32 => {
+            build_input_stream_for::<i32>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::I64 => {
+            build_input_stream_for::<i64>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::U8 => build_input_stream_for::<u8>(device, config, channels, capture_queue)?,
+        SampleFormat::U16 => {
+            build_input_stream_for::<u16>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::U24 => {
+            build_input_stream_for::<U24>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::U32 => {
+            build_input_stream_for::<u32>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::U64 => {
+            build_input_stream_for::<u64>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::F32 => {
+            build_input_stream_for::<f32>(device, config, channels, capture_queue)?
+        }
+        SampleFormat::F64 => {
+            build_input_stream_for::<f64>(device, config, channels, capture_queue)?
+        }
         SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
             bail!("DSD input sample format {sample_format:?} is not supported")
         }
@@ -661,7 +825,7 @@ fn build_input_stream_for<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     channels: usize,
-    tx: SyncSender<Vec<StereoFrame>>,
+    capture_queue: Arc<CaptureQueue>,
 ) -> Result<Stream>
 where
     T: Sample + SizedSample + Send + 'static,
@@ -671,7 +835,7 @@ where
     Ok(device.build_input_stream(
         *config,
         move |data: &[T], _| {
-            let _ = tx.try_send(input_to_stereo(data, channels));
+            capture_queue.push_realtime(input_to_stereo(data, channels));
         },
         err_fn,
         None,
@@ -807,4 +971,51 @@ fn new_stream_id() -> u64 {
         .unwrap_or_default()
         .as_nanos();
     (now as u64) ^ ((now >> 64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(value: f32, frames: usize) -> Vec<StereoFrame> {
+        vec![
+            StereoFrame {
+                left: value,
+                right: value,
+            };
+            frames
+        ]
+    }
+
+    #[test]
+    fn capture_queue_push_drops_oldest_when_full() {
+        let queue = CaptureQueue::new(2);
+
+        queue.push_realtime(chunk(1.0, 10));
+        queue.push_realtime(chunk(2.0, 20));
+        queue.push_realtime(chunk(3.0, 30));
+
+        let first = queue.recv_timeout(Duration::from_millis(0)).unwrap();
+        assert_eq!(first[0].left, 2.0);
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.dropped_chunks, 1);
+        assert_eq!(snapshot.dropped_frames, 10);
+    }
+
+    #[test]
+    fn capture_queue_latest_recv_discards_backlog() {
+        let queue = CaptureQueue::new(4);
+
+        queue.push_realtime(chunk(1.0, 10));
+        queue.push_realtime(chunk(2.0, 20));
+        queue.push_realtime(chunk(3.0, 30));
+
+        let latest = queue.recv_latest_timeout(Duration::from_millis(0)).unwrap();
+        assert_eq!(latest[0].left, 3.0);
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.dropped_chunks, 2);
+        assert_eq!(snapshot.dropped_frames, 30);
+    }
 }

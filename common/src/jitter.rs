@@ -231,7 +231,7 @@ impl JitterBuffer {
     }
 
     pub fn pull_f32_at_sample_rate(&mut self, output: &mut [f32], output_sample_rate: u32) {
-        self.pull_f32_at_sample_rate_with_buffer_target(output, output_sample_rate, 0);
+        self.pull_f32_at_sample_rate_with_playout_buffer(output, output_sample_rate, 0);
     }
 
     pub fn pull_f32_at_sample_rate_for_playout(
@@ -240,23 +240,27 @@ impl JitterBuffer {
         output_sample_rate: u32,
         _first_output_playout_at: Instant,
     ) {
-        self.pull_f32_at_sample_rate_with_buffer_target(output, output_sample_rate, 0);
+        self.pull_f32_at_sample_rate_with_playout_buffer(output, output_sample_rate, 0);
     }
 
-    pub fn pull_f32_at_sample_rate_with_buffer_target(
+    pub fn pull_f32_at_sample_rate_with_playout_buffer(
         &mut self,
         output: &mut [f32],
         output_sample_rate: u32,
-        buffered_after_pull_frames: u64,
+        playout_buffered_after_pull_frames: u64,
     ) {
-        self.pull_fixed_f32_at_sample_rate(output, output_sample_rate, buffered_after_pull_frames);
+        self.pull_fixed_f32_at_sample_rate(
+            output,
+            output_sample_rate,
+            playout_buffered_after_pull_frames,
+        );
     }
 
     fn pull_fixed_f32_at_sample_rate(
         &mut self,
         output: &mut [f32],
         output_sample_rate: u32,
-        buffered_after_pull_frames: u64,
+        playout_buffered_after_pull_frames: u64,
     ) {
         output.fill(0.0);
         if output.is_empty() || self.config.channels == 0 {
@@ -276,7 +280,7 @@ impl JitterBuffer {
         let desired_after_pull = self
             .config
             .fixed_delay_frames
-            .saturating_add(buffered_after_pull_frames);
+            .saturating_sub(playout_buffered_after_pull_frames);
         let required_before_pull = desired_after_pull.saturating_add(source_frames_to_render);
 
         let Some(correction_ppm) =
@@ -384,6 +388,23 @@ impl JitterBuffer {
 
     pub fn target_ms(&self) -> u32 {
         self.config.target_ms
+    }
+
+    pub fn trim_to_playout_buffer_budget(&mut self, playout_buffered_frames: u64) {
+        if self.stream_id.is_none() || self.state == JitterState::NotStarted {
+            return;
+        }
+
+        let desired_buffer_frames = self
+            .config
+            .fixed_delay_frames
+            .saturating_sub(playout_buffered_frames);
+        let current_buffer = self.buffer_level_frames();
+        if current_buffer > desired_buffer_frames.saturating_add(self.hard_trim_tolerance_frames())
+        {
+            self.trim_to_buffer_depth(desired_buffer_frames);
+            self.refresh_metrics();
+        }
     }
 
     fn update_sequence_metrics(&mut self, sequence: u32) {
@@ -886,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_buffer_accounts_for_pending_output_ring_fill() {
+    fn fixed_buffer_treats_playout_ring_as_part_of_fixed_delay() {
         let t0 = Instant::now();
         let mut buffer = JitterBuffer::new(JitterConfig {
             target_ms: 100,
@@ -898,21 +919,49 @@ mod tests {
         }
 
         let mut out = vec![0.0; 240 * 2];
-        for remaining_chunks in (0..8).rev() {
-            let remaining_ring_frames = (remaining_chunks * 240) as u64;
-            buffer.pull_f32_at_sample_rate_with_buffer_target(
+        for queued_chunks_after_pull in 1..=8 {
+            let playout_buffered_frames = (queued_chunks_after_pull * 240) as u64;
+            buffer.pull_f32_at_sample_rate_with_playout_buffer(
                 &mut out,
                 SAMPLE_RATE,
-                remaining_ring_frames,
+                playout_buffered_frames,
             );
             assert_eq!(
-                buffer.metrics().buffer_level_frames,
-                4_800 + remaining_ring_frames
+                buffer
+                    .metrics()
+                    .buffer_level_frames
+                    .saturating_add(playout_buffered_frames),
+                4_800
             );
         }
 
         let metrics = buffer.metrics();
         assert_eq!(metrics.state, JitterState::Running);
-        assert_eq!(metrics.buffer_level_frames, 4_800);
+        assert_eq!(metrics.buffer_level_frames, 2_880);
+    }
+
+    #[test]
+    fn trims_jitter_backlog_against_playout_ring_budget() {
+        let t0 = Instant::now();
+        let mut buffer = JitterBuffer::new(JitterConfig {
+            target_ms: 100,
+            fixed_delay_frames: 4_800,
+            ..JitterConfig::default()
+        });
+        for sequence in 0..40 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), t0);
+        }
+
+        let mut out = vec![0.0; 240 * 2];
+        buffer.pull_f32_at_sample_rate_with_playout_buffer(&mut out, SAMPLE_RATE, 1_920);
+        assert_eq!(buffer.metrics().buffer_level_frames, 2_880);
+
+        for sequence in 40..80 {
+            buffer.insert_packet(packet(sequence, sequence as u64 * 240), t0);
+        }
+        assert!(buffer.metrics().buffer_level_frames > 2_880);
+
+        buffer.trim_to_playout_buffer_budget(1_920);
+        assert_eq!(buffer.metrics().buffer_level_frames, 2_880);
     }
 }

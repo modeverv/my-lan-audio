@@ -18,10 +18,13 @@
 - receiver output: `null`, WAV file, CPAL audio output (CoreAudio / WASAPI)
 - receiver-side output resampling: output device が 44.1 kHz / 48 kHz どちらでも出力
 - jitter buffer, loss / late / duplicate / out-of-order metrics
-- fixed-buffer playout scheduler: `--fixed-delay-frames <FRAMES>`。`--fixed-latency-ms <MS>` は人間向け alias
+- fixed-buffer playout scheduler: `--fixed-delay-frames <FRAMES>` は receiver 内部の `jitter + output ring` 合算予算。`--fixed-latency-ms <MS>` は人間向け alias
 - receiver -> sender feedback status UDP
 - receiver audio callback は SPSC ring 読み取り専用
 - `JitterBuffer` は renderer / timed output 側が単独所有し、audio callback や UDP receive thread と `Mutex<JitterBuffer>` を共有しない
+- receiver の UDP thread -> renderer queue は満杯時に古いeventを捨て、新しいpacketを残す
+- renderer は output ring 水位と UDP event 到着で起床し、固定sleepによる余分な待ちを抑える
+- sender live capture は処理遅れ時に古いcapture chunkを捨て、最新chunkへ追いつく
 - output ring の既定値は `40ms`
 - queue drop / ring underrun / steady underrun などの安定性 metrics
 
@@ -542,7 +545,7 @@ mise exec -- cargo run -p receiver -- \
 --test-tone                             receiver単体でtest tone出力
 --sample-rate <HZ>                      packet sample rate。現在は48000のみ
 --channels <N>                          channel数。現在は2のみ
---fixed-delay-frames <FRAMES>           固定 playout delay。default: 14400
+--fixed-delay-frames <FRAMES>           receiver内部の合算固定 playout delay。default: 14400
 --fixed-latency-ms <MS>                 人間向けalias。48kHz framesへ変換
 --output-buffer-size-frames <FRAMES>    audio backend buffer size固定指定
 --output-ring-ms <MS>                   audio callback前のSPSC ring目標量。default: 40
@@ -561,6 +564,7 @@ sender:
 ```text
 sender: input=capture packets=200.0/s bitrate=1.619Mbps sequence=...
         capture_buffer=...ms rms=-20.8/-20.8dB dropped=0 errors=0
+        capture_qdrop=0.0/s capture_qdrop_frames=0/s capture_lock_miss=0.0/s
         remote_buf=...fr/...ms remote_outq=...fr/...ms remote_total=...fr/...ms remote_qdrop=0 ...
 ```
 
@@ -570,6 +574,9 @@ sender: input=capture packets=200.0/s bitrate=1.619Mbps sequence=...
 - `bitrate`: 48kHz / stereo / 16-bit なら約 `1.6Mbps`
 - `rms`: capture 音量。無音なら `-120dB` 付近
 - `dropped`, `errors`: sender 側送信異常
+- `capture_qdrop`: sender live capture queue で低遅延維持のために捨てた古いchunk
+- `capture_qdrop_frames`: 捨てたcapture frame数
+- `capture_lock_miss`: capture callback が queue lock を取れず chunk を捨てた回数
 - `remote_buf`: receiver の jitter buffer 水位
 - `remote_outq`: receiver の output ring 水位
 - `remote_total`: receiver 内部の合算 buffer 水位
@@ -583,7 +590,7 @@ receiver:
 ```text
 receiver: state=Running packets=200.0/s queued=200.0/s qdrop=0.0/s qinvalid=0.0/s
           loss=0.0/s late=0.0/s dup=0.0/s ooo=0.0/s
-          buf=12000fr/250.0ms fixed=14400fr/300.0ms outq=2646fr/60.0ms total_buf=14880fr/310.0ms
+          buf=12480fr/260.0ms fixed=14400fr/300.0ms outq=1920fr/40.0ms total_buf=14400fr/300.0ms
           ratio=0.999970 drift=...ppm startup_under=... steady_under=0
           lock_miss=0.0/s ring_under=0.0/s ring_missing=0/s ring_overflow=0/s
 ```
@@ -591,7 +598,7 @@ receiver: state=Running packets=200.0/s queued=200.0/s qdrop=0.0/s qinvalid=0.0/
 安定している目安:
 
 - `packets` と `queued` が約 `200/s`
-- `qdrop=0.0/s`
+- `qdrop=0.0/s`。非ゼロなら receiver queue が古いeventを捨てて最新packetを優先している
 - `loss=0.0/s`, `late=0.0/s`, `dup=0.0/s`, `ooo=0.0/s`
 - `steady_under=0`
 - `ring_under=0.0/s`
@@ -621,7 +628,7 @@ jitter buffer latency
 + capture device 側の遅延
 ```
 
-receiver は固定バッファ playout のみです。既定値は `--fixed-delay-frames 14400` で、48kHz 基準の 300ms です。固定設定では以下を目安にします。
+receiver は固定バッファ playout のみです。既定値は `--fixed-delay-frames 14400` で、48kHz 基準の 300ms です。この値は receiver 内部の `jitter buffer + output ring` の合算予算として扱われます。renderer は output ring に積まれた分を jitter 側の必要水位から差し引きます。
 
 ```text
 fixed / remote_fixed = 14400fr
@@ -629,7 +636,9 @@ outq / remote_outq = audio callback手前のoutput ring水位
 total_buf / remote_total ~= fixed
 ```
 
-`--fixed-delay-frames 14400` の場合、receiver 内部の buffered latency は jitter buffer と output ring の合算でおおむね `14400fr` です。実際に耳やDAWで観測される遅延には、そこへ backend/device/capture 側の固定遅延が加わります。DAW 側で固定補正する場合は、クリックやパルスで実測して補正値を決めてください。
+`--fixed-delay-frames 14400` かつ `--output-ring-ms 40` の場合、output ring が約 `1920fr` なら jitter buffer は約 `12480fr` を目標にします。receiver 内部の buffered latency は合算でおおむね `14400fr` です。実際に耳やDAWで観測される遅延には、そこへ backend/device/capture 側の固定遅延が加わります。DAW 側で固定補正する場合は、クリックやパルスで実測して補正値を決めてください。
+
+audio output では `--output-ring-ms` が固定delay内に収まる必要があります。例えば `--fixed-latency-ms 20` を指定する場合、`--output-ring-ms` は 20ms 未満にしてください。
 
 ## bit depth と clipping
 

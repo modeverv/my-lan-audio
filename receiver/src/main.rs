@@ -13,13 +13,13 @@ use lan_audio_common::jitter::{InsertOutcome, JitterBuffer, JitterConfig, Jitter
 use lan_audio_common::packet::AudioPacket;
 use lan_audio_common::status::ReceiverStatus;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufWriter;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -203,6 +203,12 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
     if timing.output_ring_capacity_ms < timing.output_ring_ms + timing.render_chunk_ms {
         bail!("--output-ring-capacity-ms must be at least --output-ring-ms + --render-chunk-ms");
     }
+    if output_mode(args) == "audio" {
+        let output_ring_frames = ms_to_frames(timing.output_ring_ms, args.sample_rate);
+        if output_ring_frames > timing.fixed_delay_frames {
+            bail!("--output-ring-ms must fit within --fixed-delay-frames / --fixed-latency-ms");
+        }
+    }
     if args.packet_queue_capacity == 0 {
         bail!("--packet-queue-capacity must be greater than zero");
     }
@@ -227,25 +233,29 @@ fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
         target_ms: timing.target_buffer_ms,
         fixed_delay_frames: timing.fixed_delay_frames,
     };
-    let (event_tx, event_rx) = sync_channel(args.packet_queue_capacity);
+    let event_queue = Arc::new(ReceiverEventQueue::new(args.packet_queue_capacity));
     let ingress_metrics = Arc::new(IngressMetrics::default());
     let receiver_state = Arc::new(ReceiverState::new(timing.target_buffer_ms));
 
-    spawn_udp_receiver(socket, event_tx, Arc::clone(&ingress_metrics));
+    spawn_udp_receiver(
+        socket,
+        Arc::clone(&event_queue),
+        Arc::clone(&ingress_metrics),
+    );
 
     match output_mode(args).as_str() {
         "audio" => run_audio_output(
             args,
             timing,
             jitter_config,
-            event_rx,
+            Arc::clone(&event_queue),
             receiver_state,
             Arc::clone(&ingress_metrics),
         ),
         "wav" => run_timed_pull_output(
             args,
             jitter_config,
-            event_rx,
+            Arc::clone(&event_queue),
             receiver_state,
             Arc::clone(&ingress_metrics),
             args.output_file.as_deref(),
@@ -253,7 +263,7 @@ fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
         "null" => run_timed_pull_output(
             args,
             jitter_config,
-            event_rx,
+            Arc::clone(&event_queue),
             receiver_state,
             Arc::clone(&ingress_metrics),
             None,
@@ -286,6 +296,60 @@ fn bind_socket(addr: SocketAddr, recv_buffer_bytes: usize) -> Result<UdpSocket> 
 enum ReceiverEvent {
     Packet(AudioPacket, SocketAddr, Instant),
     InvalidPacket,
+}
+
+struct ReceiverEventQueue {
+    capacity: usize,
+    events: Mutex<VecDeque<ReceiverEvent>>,
+    ready: Condvar,
+}
+
+impl ReceiverEventQueue {
+    fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "receiver event queue capacity must be non-zero"
+        );
+        Self {
+            capacity,
+            events: Mutex::new(VecDeque::with_capacity(capacity)),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn push_drop_oldest(&self, event: ReceiverEvent) -> bool {
+        let Ok(mut events) = self.events.lock() else {
+            return true;
+        };
+        let dropped_oldest = if events.len() >= self.capacity {
+            events.pop_front();
+            true
+        } else {
+            false
+        };
+        events.push_back(event);
+        self.ready.notify_one();
+        dropped_oldest
+    }
+
+    fn drain_into(&self, output: &mut Vec<ReceiverEvent>) {
+        let Ok(mut events) = self.events.lock() else {
+            return;
+        };
+        output.extend(events.drain(..));
+    }
+
+    fn wait_for_event_or_timeout(&self, timeout: Duration) {
+        let Ok(events) = self.events.lock() else {
+            return;
+        };
+        if !events.is_empty() {
+            return;
+        }
+        let Ok((_events, _timeout)) = self.ready.wait_timeout(events, timeout) else {
+            return;
+        };
+    }
 }
 
 #[derive(Default)]
@@ -406,7 +470,7 @@ impl ReceiverState {
 
 fn spawn_udp_receiver(
     socket: UdpSocket,
-    event_tx: SyncSender<ReceiverEvent>,
+    event_queue: Arc<ReceiverEventQueue>,
     ingress_metrics: Arc<IngressMetrics>,
 ) {
     thread::spawn(move || {
@@ -418,7 +482,7 @@ fn spawn_udp_receiver(
                     match AudioPacket::from_bytes(&buf[..len]) {
                         Ok(packet) => {
                             send_receiver_event(
-                                &event_tx,
+                                &event_queue,
                                 ReceiverEvent::Packet(packet, source, arrival),
                                 &ingress_metrics,
                                 false,
@@ -427,7 +491,7 @@ fn spawn_udp_receiver(
                         Err(err) => {
                             eprintln!("receiver: invalid packet: {err}");
                             send_receiver_event(
-                                &event_tx,
+                                &event_queue,
                                 ReceiverEvent::InvalidPacket,
                                 &ingress_metrics,
                                 true,
@@ -442,30 +506,29 @@ fn spawn_udp_receiver(
 }
 
 fn send_receiver_event(
-    event_tx: &SyncSender<ReceiverEvent>,
+    event_queue: &ReceiverEventQueue,
     event: ReceiverEvent,
     ingress_metrics: &IngressMetrics,
     invalid: bool,
 ) {
-    match event_tx.try_send(event) {
-        Ok(()) => {
-            if invalid {
-                ingress_metrics.record_invalid_queued();
-            } else {
-                ingress_metrics.record_packet_queued();
-            }
-        }
-        Err(TrySendError::Full(_)) => ingress_metrics.record_queue_drop(),
-        Err(TrySendError::Disconnected(_)) => {}
+    if event_queue.push_drop_oldest(event) {
+        ingress_metrics.record_queue_drop();
+    }
+    if invalid {
+        ingress_metrics.record_invalid_queued();
+    } else {
+        ingress_metrics.record_packet_queued();
     }
 }
 
 fn drain_receiver_events(
-    event_rx: &Receiver<ReceiverEvent>,
+    event_queue: &ReceiverEventQueue,
+    event_scratch: &mut Vec<ReceiverEvent>,
     jitter: &mut JitterBuffer,
     ingress_metrics: &IngressMetrics,
 ) {
-    while let Ok(event) = event_rx.try_recv() {
+    event_queue.drain_into(event_scratch);
+    for event in event_scratch.drain(..) {
         match event {
             ReceiverEvent::Packet(packet, source, arrival) => {
                 let stream_id = packet.header.stream_id;
@@ -480,7 +543,7 @@ fn drain_receiver_events(
 fn run_timed_pull_output(
     args: &Args,
     jitter_config: JitterConfig,
-    event_rx: Receiver<ReceiverEvent>,
+    event_queue: Arc<ReceiverEventQueue>,
     receiver_state: Arc<ReceiverState>,
     ingress_metrics: Arc<IngressMetrics>,
     output_file: Option<&Path>,
@@ -509,6 +572,7 @@ fn run_timed_pull_output(
     let mut next_tick = Instant::now();
     let start = Instant::now();
     let mut output = vec![0.0f32; chunk_frames * channels];
+    let mut event_scratch = Vec::new();
 
     loop {
         if duration_elapsed(start, args.duration_sec) {
@@ -518,7 +582,12 @@ fn run_timed_pull_output(
             return Ok(());
         }
 
-        drain_receiver_events(&event_rx, &mut jitter, &ingress_metrics);
+        drain_receiver_events(
+            &event_queue,
+            &mut event_scratch,
+            &mut jitter,
+            &ingress_metrics,
+        );
         jitter.pull_f32_at_sample_rate_for_playout(&mut output, args.sample_rate, next_tick);
         receiver_state.publish(&jitter);
 
@@ -538,7 +607,7 @@ fn run_audio_output(
     args: &Args,
     timing: ReceiverTiming,
     jitter_config: JitterConfig,
-    event_rx: Receiver<ReceiverEvent>,
+    event_queue: Arc<ReceiverEventQueue>,
     receiver_state: Arc<ReceiverState>,
     ingress_metrics: Arc<IngressMetrics>,
 ) -> Result<()> {
@@ -567,7 +636,7 @@ fn run_audio_output(
     let callback_metrics = Arc::new(OutputCallbackMetrics::default());
     spawn_ring_renderer(
         jitter_config,
-        event_rx,
+        event_queue,
         Arc::clone(&ring),
         Arc::clone(&callback_metrics),
         Arc::clone(&receiver_state),
@@ -715,7 +784,7 @@ struct RingRendererConfig {
 
 fn spawn_ring_renderer(
     jitter_config: JitterConfig,
-    event_rx: Receiver<ReceiverEvent>,
+    event_queue: Arc<ReceiverEventQueue>,
     ring: Arc<SpscF32Ring>,
     metrics: Arc<OutputCallbackMetrics>,
     receiver_state: Arc<ReceiverState>,
@@ -730,20 +799,32 @@ fn spawn_ring_renderer(
             }
             let mut jitter = JitterBuffer::new(jitter_config);
             let channels = config.channels.max(1);
-            let target_samples =
-                samples_from_ms(config.output_sample_rate, channels, config.output_ring_ms);
+            let target_frames =
+                (config.output_sample_rate as usize * config.output_ring_ms as usize / 1000).max(1);
+            let target_samples = target_frames.saturating_mul(channels);
             let chunk_frames =
                 (config.output_sample_rate as usize * config.render_chunk_ms as usize / 1000)
                     .max(1);
             let mut render_scratch = vec![0.0f32; chunk_frames * channels];
+            let mut event_scratch = Vec::new();
             let sleep_divisor = 2;
             let min_sleep_us = 1_000;
-            let sleep_duration = Duration::from_micros(
+            let max_sleep_duration = Duration::from_micros(
                 ((config.render_chunk_ms as u64 * 1000) / sleep_divisor).max(min_sleep_us),
             );
 
             loop {
-                drain_receiver_events(&event_rx, &mut jitter, &ingress_metrics);
+                drain_receiver_events(
+                    &event_queue,
+                    &mut event_scratch,
+                    &mut jitter,
+                    &ingress_metrics,
+                );
+                let queued_source_frames = output_frames_to_source_frames_ceil(
+                    ring.len_samples() / channels,
+                    config.output_sample_rate,
+                );
+                jitter.trim_to_playout_buffer_budget(queued_source_frames);
                 loop {
                     let queued = ring.len_samples();
                     metrics.record_output_queue_samples(queued);
@@ -760,16 +841,15 @@ fn spawn_ring_renderer(
                     let sample_count = frames_to_render * channels;
                     let scratch = &mut render_scratch[..sample_count];
 
-                    let missing_frames_after_render =
-                        (missing_samples / channels).saturating_sub(frames_to_render);
-                    let buffered_after_pull_frames = ((missing_frames_after_render as f64
-                        * SAMPLE_RATE as f64)
-                        / config.output_sample_rate.max(1) as f64)
-                        .ceil() as u64;
-                    jitter.pull_f32_at_sample_rate_with_buffer_target(
+                    let queued_frames_after_render = (queued / channels) + frames_to_render;
+                    let playout_buffered_after_pull_frames = output_frames_to_source_frames_ceil(
+                        queued_frames_after_render,
+                        config.output_sample_rate,
+                    );
+                    jitter.pull_f32_at_sample_rate_with_playout_buffer(
                         scratch,
                         config.output_sample_rate,
-                        buffered_after_pull_frames,
+                        playout_buffered_after_pull_frames,
                     );
 
                     let pushed = ring.push_interleaved(scratch, channels);
@@ -780,7 +860,14 @@ fn spawn_ring_renderer(
                 }
 
                 receiver_state.publish(&jitter);
-                thread::sleep(sleep_duration);
+                let sleep_duration = renderer_sleep_duration(
+                    ring.len_samples() / channels,
+                    target_frames,
+                    chunk_frames,
+                    config.output_sample_rate,
+                    max_sleep_duration,
+                );
+                event_queue.wait_for_event_or_timeout(sleep_duration);
             }
         });
 
@@ -840,6 +927,33 @@ where
 fn samples_from_ms(sample_rate: u32, channels: usize, ms: u32) -> usize {
     let channels = channels.max(1);
     ((sample_rate as usize * ms as usize / 1000).max(1)).saturating_mul(channels)
+}
+
+fn output_frames_to_source_frames_ceil(output_frames: usize, output_sample_rate: u32) -> u64 {
+    let output_sample_rate = u64::from(output_sample_rate.max(1));
+    (output_frames as u64)
+        .saturating_mul(u64::from(SAMPLE_RATE))
+        .saturating_add(output_sample_rate - 1)
+        / output_sample_rate
+}
+
+fn renderer_sleep_duration(
+    queued_frames: usize,
+    target_frames: usize,
+    chunk_frames: usize,
+    output_sample_rate: u32,
+    max_sleep: Duration,
+) -> Duration {
+    let sample_rate = output_sample_rate.max(1) as u128;
+    let low_water_frames = target_frames.saturating_sub(chunk_frames.max(1));
+    let frames_until_low_water = queued_frames.saturating_sub(low_water_frames);
+    let micros_until_low_water = (frames_until_low_water as u128)
+        .saturating_mul(1_000_000)
+        .checked_div(sample_rate)
+        .unwrap_or(0);
+    let max_sleep_us = max_sleep.as_micros().max(250);
+    let sleep_us = (micros_until_low_water / 2).clamp(250, max_sleep_us);
+    Duration::from_micros(sleep_us as u64)
 }
 
 fn scratch_len_for_stream(config: &StreamConfig) -> usize {
@@ -1412,5 +1526,44 @@ mod tests {
         args.fixed_latency_ms = Some(200);
 
         assert!(ReceiverTiming::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn audio_output_ring_must_fit_inside_fixed_delay() {
+        let mut args = default_args();
+        args.output = "audio".to_string();
+        args.fixed_latency_ms = Some(20);
+        args.output_ring_ms = 40;
+        args.output_ring_capacity_ms = 80;
+        let timing = ReceiverTiming::from_args(&args).unwrap();
+
+        assert!(validate_audio_args(&args, &timing).is_err());
+    }
+
+    #[test]
+    fn receiver_event_queue_drops_oldest_when_full() {
+        let queue = ReceiverEventQueue::new(2);
+
+        assert!(!queue.push_drop_oldest(ReceiverEvent::InvalidPacket));
+        assert!(!queue.push_drop_oldest(ReceiverEvent::InvalidPacket));
+        assert!(queue.push_drop_oldest(ReceiverEvent::InvalidPacket));
+
+        let mut events = Vec::new();
+        queue.drain_into(&mut events);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn renderer_sleep_wakes_near_low_watermark() {
+        let max_sleep = Duration::from_micros(2_500);
+
+        assert_eq!(
+            renderer_sleep_duration(1_920, 1_920, 240, SAMPLE_RATE, max_sleep),
+            max_sleep
+        );
+        assert_eq!(
+            renderer_sleep_duration(1_680, 1_920, 240, SAMPLE_RATE, max_sleep),
+            Duration::from_micros(250)
+        );
     }
 }
