@@ -31,6 +31,10 @@
 - [x] Windows: capture meterコード
 - [x] Windows: capture WAV保存コード
 - [x] Windows: WASAPI/cpal → UDP senderコード
+- [x] Windows: x86_64-pc-windows-msvc hostでcargo check
+- [x] Windows: sender / receiver デバイス一覧確認
+- [x] Windows: PowerShell launcher追加
+- [x] Windows: CPAL PCM/float sample format対応拡張
 ```
 
 この場で検証済み:

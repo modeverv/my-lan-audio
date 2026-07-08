@@ -4,7 +4,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use audio_ring::SpscF32Ring;
 use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
+use cpal::{
+    BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24,
+};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use lan_audio_common::audio::{f32_to_i16, CHANNELS, SAMPLE_RATE};
 use lan_audio_common::jitter::{JitterBuffer, JitterConfig, JitterMetrics};
@@ -673,98 +675,92 @@ fn build_ring_output_stream(
     ring: Arc<SpscF32Ring>,
     callback_metrics: Arc<OutputCallbackMetrics>,
 ) -> Result<Stream> {
-    let err_fn = |err| eprintln!("audio output stream error: {err}");
-    let channels = usize::from(config.channels.max(1));
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            let ring = Arc::clone(&ring);
-            let callback_metrics = Arc::clone(&callback_metrics);
-            let mut last_frame = vec![0.0f32; channels];
-            device.build_output_stream(
-                *config,
-                move |data: &mut [f32], _| {
-                    callback_metrics.record_callback(data.len() / channels);
-                    let popped = ring.pop_interleaved(data, channels);
-                    callback_metrics.record_output_queue_samples(ring.len_samples());
-                    if popped > 0 {
-                        update_last_frame(&data[..popped], channels, &mut last_frame);
-                    }
-                    if popped < data.len() {
-                        callback_metrics.record_ring_underrun((data.len() - popped) / channels);
-                        fill_with_last_frame_f32(&mut data[popped..], channels, &last_frame);
-                    }
-                },
-                err_fn,
-                None,
-            )?
+        SampleFormat::I8 => {
+            build_ring_output_stream_for::<i8>(device, config, ring, callback_metrics)?
         }
         SampleFormat::I16 => {
-            let ring = Arc::clone(&ring);
-            let callback_metrics = Arc::clone(&callback_metrics);
-            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
-            let mut last_frame = vec![0.0f32; channels];
-            device.build_output_stream(
-                *config,
-                move |data: &mut [i16], _| {
-                    callback_metrics.record_callback(data.len() / channels);
-                    if data.len() > scratch.len() {
-                        callback_metrics.record_scratch_overflow();
-                        fill_with_last_frame_i16(data, channels, &last_frame);
-                        return;
-                    }
-                    let scratch = &mut scratch[..data.len()];
-                    let popped = ring.pop_interleaved(scratch, channels);
-                    callback_metrics.record_output_queue_samples(ring.len_samples());
-                    if popped > 0 {
-                        update_last_frame(&scratch[..popped], channels, &mut last_frame);
-                    }
-                    if popped < scratch.len() {
-                        callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
-                        fill_with_last_frame_f32(&mut scratch[popped..], channels, &last_frame);
-                    }
-                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                        *dst = f32_to_i16(src);
-                    }
-                },
-                err_fn,
-                None,
-            )?
+            build_ring_output_stream_for::<i16>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::I24 => {
+            build_ring_output_stream_for::<I24>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::I32 => {
+            build_ring_output_stream_for::<i32>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::I64 => {
+            build_ring_output_stream_for::<i64>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::U8 => {
+            build_ring_output_stream_for::<u8>(device, config, ring, callback_metrics)?
         }
         SampleFormat::U16 => {
-            let ring = Arc::clone(&ring);
-            let callback_metrics = Arc::clone(&callback_metrics);
-            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
-            let mut last_frame = vec![0.0f32; channels];
-            device.build_output_stream(
-                *config,
-                move |data: &mut [u16], _| {
-                    callback_metrics.record_callback(data.len() / channels);
-                    if data.len() > scratch.len() {
-                        callback_metrics.record_scratch_overflow();
-                        fill_with_last_frame_u16(data, channels, &last_frame);
-                        return;
-                    }
-                    let scratch = &mut scratch[..data.len()];
-                    let popped = ring.pop_interleaved(scratch, channels);
-                    callback_metrics.record_output_queue_samples(ring.len_samples());
-                    if popped > 0 {
-                        update_last_frame(&scratch[..popped], channels, &mut last_frame);
-                    }
-                    if popped < scratch.len() {
-                        callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
-                        fill_with_last_frame_f32(&mut scratch[popped..], channels, &last_frame);
-                    }
-                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                        *dst = f32_to_u16(src);
-                    }
-                },
-                err_fn,
-                None,
-            )?
+            build_ring_output_stream_for::<u16>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::U24 => {
+            build_ring_output_stream_for::<U24>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::U32 => {
+            build_ring_output_stream_for::<u32>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::U64 => {
+            build_ring_output_stream_for::<u64>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::F32 => {
+            build_ring_output_stream_for::<f32>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::F64 => {
+            build_ring_output_stream_for::<f64>(device, config, ring, callback_metrics)?
+        }
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
+            bail!("DSD output sample format {sample_format:?} is not supported")
         }
         other => bail!("unsupported output sample format {other:?}"),
     };
     Ok(stream)
+}
+
+fn build_ring_output_stream_for<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    ring: Arc<SpscF32Ring>,
+    callback_metrics: Arc<OutputCallbackMetrics>,
+) -> Result<Stream>
+where
+    T: Sample + SizedSample + FromSample<f32> + Send + 'static,
+{
+    let err_fn = |err| eprintln!("audio output stream error: {err}");
+    let channels = usize::from(config.channels.max(1));
+    let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
+    let mut last_frame = vec![0.0f32; channels];
+
+    Ok(device.build_output_stream(
+        *config,
+        move |data: &mut [T], _| {
+            callback_metrics.record_callback(data.len() / channels);
+            if data.len() > scratch.len() {
+                callback_metrics.record_scratch_overflow();
+                fill_with_last_frame(data, channels, &last_frame);
+                return;
+            }
+
+            let scratch = &mut scratch[..data.len()];
+            let popped = ring.pop_interleaved(scratch, channels);
+            callback_metrics.record_output_queue_samples(ring.len_samples());
+            if popped > 0 {
+                update_last_frame(&scratch[..popped], channels, &mut last_frame);
+            }
+            if popped < scratch.len() {
+                callback_metrics.record_ring_underrun((scratch.len() - popped) / channels);
+                fill_scratch_with_last_frame(&mut scratch[popped..], channels, &last_frame);
+            }
+            for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
+                *dst = output_sample(src);
+            }
+        },
+        err_fn,
+        None,
+    )?)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -864,7 +860,7 @@ fn update_last_frame(samples: &[f32], channels: usize, last_frame: &mut [f32]) {
     last_frame[..channels].copy_from_slice(&samples[start..start + channels]);
 }
 
-fn fill_with_last_frame_f32(data: &mut [f32], channels: usize, last_frame: &[f32]) {
+fn fill_scratch_with_last_frame(data: &mut [f32], channels: usize, last_frame: &[f32]) {
     for frame in data.chunks_exact_mut(channels) {
         for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
             *dst = src;
@@ -872,20 +868,22 @@ fn fill_with_last_frame_f32(data: &mut [f32], channels: usize, last_frame: &[f32
     }
 }
 
-fn fill_with_last_frame_i16(data: &mut [i16], channels: usize, last_frame: &[f32]) {
+fn fill_with_last_frame<T>(data: &mut [T], channels: usize, last_frame: &[f32])
+where
+    T: Sample + FromSample<f32>,
+{
     for frame in data.chunks_exact_mut(channels) {
         for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
-            *dst = f32_to_i16(src);
+            *dst = output_sample(src);
         }
     }
 }
 
-fn fill_with_last_frame_u16(data: &mut [u16], channels: usize, last_frame: &[f32]) {
-    for frame in data.chunks_exact_mut(channels) {
-        for (dst, src) in frame.iter_mut().zip(last_frame.iter().copied()) {
-            *dst = f32_to_u16(src);
-        }
-    }
+fn output_sample<T>(sample: f32) -> T
+where
+    T: Sample + FromSample<f32>,
+{
+    T::from_sample(sample.clamp(-1.0, 1.0))
 }
 
 fn samples_from_ms(sample_rate: u32, channels: usize, ms: u32) -> usize {
@@ -955,88 +953,74 @@ fn build_tone_output_stream(
     phase: Arc<Mutex<f32>>,
     freq: f32,
 ) -> Result<Stream> {
-    let sample_rate = config.sample_rate;
-    let channels = config.channels as usize;
-    let err_fn = |err| eprintln!("audio output stream error: {err}");
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            let phase = phase.clone();
-            device.build_output_stream(
-                *config,
-                move |data: &mut [f32], _| fill_tone_f32(data, channels, sample_rate, freq, &phase),
-                err_fn,
-                None,
-            )?
-        }
-        SampleFormat::I16 => {
-            let phase = phase.clone();
-            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
-            device.build_output_stream(
-                *config,
-                move |data: &mut [i16], _| {
-                    if data.len() > scratch.len() {
-                        data.fill(0);
-                        return;
-                    }
-                    let scratch = &mut scratch[..data.len()];
-                    fill_tone_f32(scratch, channels, sample_rate, freq, &phase);
-                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                        *dst = f32_to_i16(src);
-                    }
-                },
-                err_fn,
-                None,
-            )?
-        }
-        SampleFormat::U16 => {
-            let phase = phase.clone();
-            let mut scratch = vec![0.0f32; scratch_len_for_stream(config)];
-            device.build_output_stream(
-                *config,
-                move |data: &mut [u16], _| {
-                    if data.len() > scratch.len() {
-                        data.fill(u16::MAX / 2);
-                        return;
-                    }
-                    let scratch = &mut scratch[..data.len()];
-                    fill_tone_f32(scratch, channels, sample_rate, freq, &phase);
-                    for (dst, src) in data.iter_mut().zip(scratch.iter().copied()) {
-                        *dst = f32_to_u16(src);
-                    }
-                },
-                err_fn,
-                None,
-            )?
+        SampleFormat::I8 => build_tone_output_stream_for::<i8>(device, config, phase, freq)?,
+        SampleFormat::I16 => build_tone_output_stream_for::<i16>(device, config, phase, freq)?,
+        SampleFormat::I24 => build_tone_output_stream_for::<I24>(device, config, phase, freq)?,
+        SampleFormat::I32 => build_tone_output_stream_for::<i32>(device, config, phase, freq)?,
+        SampleFormat::I64 => build_tone_output_stream_for::<i64>(device, config, phase, freq)?,
+        SampleFormat::U8 => build_tone_output_stream_for::<u8>(device, config, phase, freq)?,
+        SampleFormat::U16 => build_tone_output_stream_for::<u16>(device, config, phase, freq)?,
+        SampleFormat::U24 => build_tone_output_stream_for::<U24>(device, config, phase, freq)?,
+        SampleFormat::U32 => build_tone_output_stream_for::<u32>(device, config, phase, freq)?,
+        SampleFormat::U64 => build_tone_output_stream_for::<u64>(device, config, phase, freq)?,
+        SampleFormat::F32 => build_tone_output_stream_for::<f32>(device, config, phase, freq)?,
+        SampleFormat::F64 => build_tone_output_stream_for::<f64>(device, config, phase, freq)?,
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
+            bail!("DSD output sample format {sample_format:?} is not supported")
         }
         other => bail!("unsupported output sample format {other:?}"),
     };
     Ok(stream)
 }
 
-fn fill_tone_f32(
-    data: &mut [f32],
+fn build_tone_output_stream_for<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    phase: Arc<Mutex<f32>>,
+    freq: f32,
+) -> Result<Stream>
+where
+    T: Sample + SizedSample + FromSample<f32> + Send + 'static,
+{
+    let sample_rate = config.sample_rate;
+    let channels = usize::from(config.channels.max(1));
+    let err_fn = |err| eprintln!("audio output stream error: {err}");
+
+    Ok(device.build_output_stream(
+        *config,
+        move |data: &mut [T], _| fill_tone(data, channels, sample_rate, freq, &phase),
+        err_fn,
+        None,
+    )?)
+}
+
+fn fill_tone<T>(
+    data: &mut [T],
     channels: usize,
     sample_rate: u32,
     freq: f32,
     phase: &Arc<Mutex<f32>>,
-) {
+) where
+    T: Sample + FromSample<f32>,
+{
     let mut phase = match phase.try_lock() {
         Ok(phase) => phase,
         Err(_) => {
-            data.fill(0.0);
+            data.fill(T::EQUILIBRIUM);
             return;
         }
     };
     let step = freq * std::f32::consts::TAU / sample_rate as f32;
     for frame in data.chunks_exact_mut(channels) {
-        let sample = phase.sin() * 0.2;
+        let sample = output_sample(phase.sin() * 0.2);
         *phase = (*phase + step) % std::f32::consts::TAU;
         frame[0] = sample;
         if channels > 1 {
             frame[1] = sample;
         }
         for extra in frame.iter_mut().skip(2) {
-            *extra = 0.0;
+            *extra = T::EQUILIBRIUM;
         }
     }
 }
@@ -1355,10 +1339,6 @@ fn create_wav_writer(path: &Path, sample_rate: u32) -> Result<WavWriter<BufWrite
         sample_format: WavSampleFormat::Int,
     };
     Ok(WavWriter::create(path, spec)?)
-}
-
-fn f32_to_u16(sample: f32) -> u16 {
-    (((sample.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32).round() as u16
 }
 
 fn duration_elapsed(start: Instant, duration_sec: Option<f64>) -> bool {

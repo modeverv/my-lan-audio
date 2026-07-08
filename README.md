@@ -7,6 +7,7 @@
 ## 現在の状態
 
 2026-07-07 時点の実装は macOS-first で安定性改善まで入っています。
+2026-07-08 に Windows/MSVC host での build check、WASAPI デバイス一覧確認、Windows 向け PowerShell launcher、CPAL の PCM/float sample format 対応拡張を追加しました。
 
 実装済み:
 
@@ -14,7 +15,7 @@
 - UDP packet format: 48 kHz / stereo / signed 16-bit little-endian PCM
 - sender input: `dummy`, `sine`, WAV file, live capture
 - sender-side capture resampling: input device が 44.1 kHz でも 48 kHz packet に変換
-- receiver output: `null`, WAV file, CoreAudio output
+- receiver output: `null`, WAV file, CPAL audio output (CoreAudio / WASAPI)
 - receiver-side output resampling: output device が 44.1 kHz / 48 kHz どちらでも出力
 - jitter buffer, loss / late / duplicate / out-of-order metrics
 - receiver-only adaptive resampling with PI correction
@@ -32,7 +33,7 @@
 - Dante / AES67 / RTP / PTP 互換
 - 暗号化、認証、複数送信元、マルチキャスト
 
-Windows capture adapter のコードはありますが、Windows -> macOS の長時間実機検証は別途必要です。
+Windows capture / playback のコードと helper script はありますが、Windows -> macOS の長時間実機検証は別途必要です。
 
 ## 構成
 
@@ -67,7 +68,7 @@ capture / sine / wav
   -> bounded packet event queue
   -> renderer-owned JitterBuffer
   -> SPSC output ring
-  -> CoreAudio callback
+  -> CPAL audio callback
   -> output device
 ```
 
@@ -87,6 +88,7 @@ Windows で実音声を送る場合:
 
 - VB-Audio Virtual Cable
 - Windows 側で Rust build できる環境
+- PowerShell 5 以降
 - 入力デバイスとして `CABLE Output` が見える状態
 
 ## セットアップ
@@ -120,6 +122,10 @@ target/debug/sender
 target/debug/receiver
 target/release/sender
 target/release/receiver
+target/debug/sender.exe       # Windows
+target/debug/receiver.exe     # Windows
+target/release/sender.exe     # Windows
+target/release/receiver.exe   # Windows
 ```
 
 ## テスト
@@ -294,6 +300,69 @@ make receiver RECEIVER_LATENCY_MODE=low TARGET_BUFFER_MS=20 START_THRESHOLD_MS=2
 make sender SENDER_INPUT_DEVICE="BlackHole" PACKET_MS=5
 ```
 
+## Windows で動かす
+
+PowerShell の実行ポリシーで `.ps1` を直接実行できない場合は、以下のように `-ExecutionPolicy Bypass` 付きで起動してください。以降の例はプロジェクトルートから実行します。
+
+sender input device 一覧:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-sender.ps1 -ListDevices
+```
+
+receiver output device 一覧:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-receiver.ps1 -ListDevices
+```
+
+Windows 1台で UDP 経路だけ確認する場合:
+
+Terminal 1:
+
+```powershell
+.\scripts\windows-receiver.ps1 `
+  -Listen 127.0.0.1:50000 `
+  -Output wav `
+  -OutputFile .\target\windows-loopback.wav `
+  -LatencyMode normal `
+  -TargetBufferMs 80 `
+  -StartThresholdMs 80 `
+  -DurationSec 5
+```
+
+Terminal 2:
+
+```powershell
+mise exec -- cargo run -p sender -- `
+  --target 127.0.0.1:50000 `
+  --input sine `
+  --duration-sec 3
+```
+
+Windows の VB-CABLE を capture して Windows のスピーカーへ戻す場合:
+
+Terminal 1:
+
+```powershell
+.\scripts\windows-receiver.ps1 `
+  -Listen 127.0.0.1:50000 `
+  -FeedbackTarget 127.0.0.1:50001 `
+  -Output audio `
+  -OutputDevice "スピーカー"
+```
+
+Terminal 2:
+
+```powershell
+.\scripts\windows-sender.ps1 `
+  -Target 127.0.0.1:50000 `
+  -FeedbackListen 127.0.0.1:50001 `
+  -Device "CABLE Output"
+```
+
+release build で起動する場合は各 script に `-Release` を付けます。`-OutputDevice` / `-Device` は部分一致なので、デバイス一覧に出た名前の一部で指定できます。
+
 ## Windows -> macOS
 
 macOS 側 receiver:
@@ -311,10 +380,9 @@ mise exec -- cargo run -p receiver -- \
 Windows 側 sender:
 
 ```powershell
-sender.exe `
-  --target <macOSのLAN IP>:50000 `
-  --input capture `
-  --device "CABLE Output"
+.\scripts\windows-sender.ps1 `
+  -Target <macOSのLAN IP>:50000 `
+  -Device "CABLE Output"
 ```
 
 sender 側で receiver feedback も見る場合:
@@ -328,11 +396,10 @@ mise exec -- cargo run -p receiver -- \
 ```
 
 ```powershell
-sender.exe `
-  --target <macOSのLAN IP>:50000 `
-  --feedback-listen 0.0.0.0:50001 `
-  --input capture `
-  --device "CABLE Output"
+.\scripts\windows-sender.ps1 `
+  -Target <macOSのLAN IP>:50000 `
+  -FeedbackListen 0.0.0.0:50001 `
+  -Device "CABLE Output"
 ```
 
 ## sender の使い方
@@ -447,7 +514,7 @@ mise exec -- cargo run -p receiver -- \
   --output-file received.wav
 ```
 
-CoreAudio output:
+Audio output:
 
 ```bash
 mise exec -- cargo run -p receiver -- \
@@ -500,7 +567,7 @@ mise exec -- cargo run -p receiver -- \
 --listen <ADDR>                         UDP listen address。default: 0.0.0.0:50000
 --feedback-target <ADDR>                senderへstatusを返すUDP address
 --output null|audio|wav                 出力先。default: null
---output-device <NAME_PART>             CoreAudio output device name filter
+--output-device <NAME_PART>             audio output device name filter
 --output-file <PATH>                    WAV保存。指定するとwav output扱い
 --list-devices                          出力デバイス一覧
 --test-tone                             receiver単体でtest tone出力
@@ -521,8 +588,8 @@ mise exec -- cargo run -p receiver -- \
 --low-latency-trim-to-margin-ms <MS>    hard trim後にtargetへ残す余白。default: 10
 --trim-crossfade-ms <MS>                trim時の短いfade。default: 1.5
 --realtime-renderer                     renderer threadのQoS/priorityを上げる
---output-buffer-size-frames <FRAMES>    CoreAudio buffer size固定指定
---output-ring-ms <MS>                   CoreAudio callback前のSPSC ring目標量。default: 40
+--output-buffer-size-frames <FRAMES>    audio backend buffer size固定指定
+--output-ring-ms <MS>                   audio callback前のSPSC ring目標量。default: 40
 --output-ring-capacity-ms <MS>          SPSC ring容量。default: 200
 --render-chunk-ms <MS>                  rendererの生成chunk。default: 5
 --socket-recv-buffer-bytes <BYTES>      UDP socket receive buffer。default: 1048576
@@ -583,7 +650,7 @@ receiver: state=Running packets=200.0/s queued=200.0/s qdrop=0.0/s qinvalid=0.0/
 
 ```text
 latency / remote_latency: receiver jitter buffer 内の音声水位
-outq / remote_outq: CoreAudio callback手前のSPSC output ring水位
+outq / remote_outq: audio callback手前のSPSC output ring水位
 target: jitter bufferの目標水位
 ```
 
@@ -592,7 +659,7 @@ target: jitter bufferの目標水位
 ```text
 jitter buffer latency
 + output ring latency
-+ CoreAudio / device / Bluetooth 側の遅延
++ audio backend / device / Bluetooth 側の遅延
 + capture device 側の遅延
 ```
 
@@ -677,7 +744,7 @@ mise exec -- cargo run -p receiver -- --list-devices
 
 ### `ring_under` が増える
 
-receiver の output ring が薄いか、renderer thread が CoreAudio callback に追いついていません。
+receiver の output ring が薄いか、renderer thread が audio callback に追いついていません。
 
 まず安定寄りにします。
 

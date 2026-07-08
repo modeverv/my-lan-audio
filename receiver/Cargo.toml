@@ -10,5 +10,7 @@ clap = { version = "4", features = ["derive"] }
 cpal = "0.18"
 hound = "3.5"
 lan-audio-common = { path = "../common" }
-libc = "0.2"
 socket2 = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

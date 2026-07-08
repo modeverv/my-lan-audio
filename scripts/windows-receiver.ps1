@@ -1,0 +1,71 @@
+param(
+    [string]$Listen = "0.0.0.0:50000",
+    [string]$FeedbackTarget = "",
+    [ValidateSet("null", "audio", "wav")]
+    [string]$Output = "audio",
+    [string]$OutputDevice = "",
+    [string]$OutputFile = "",
+    [ValidateSet("normal", "low", "fixed-500ms")]
+    [string]$LatencyMode = "fixed-500ms",
+    [int]$TargetBufferMs = 500,
+    [int]$StartThresholdMs = 500,
+    [int]$MaxBufferMs = 550,
+    [int]$OutputRingMs = 60,
+    [int]$OutputRingCapacityMs = 160,
+    [int]$RenderChunkMs = 2,
+    [int]$OutputBufferSizeFrames = 0,
+    [double]$MetricsIntervalSec = 1.0,
+    [double]$DurationSec = 0,
+    [double]$Freq = 440.0,
+    [switch]$ListDevices,
+    [switch]$TestTone,
+    [switch]$Release
+)
+
+$ErrorActionPreference = "Stop"
+
+$cargoArgs = @("run")
+if ($Release) {
+    $cargoArgs += "--release"
+}
+
+$cargoArgs += @("-p", "receiver", "--")
+
+if ($ListDevices) {
+    $cargoArgs += "--list-devices"
+} else {
+    $cargoArgs += @(
+        "--listen", $Listen,
+        "--output", $Output,
+        "--latency-mode", $LatencyMode,
+        "--target-buffer-ms", ([string]$TargetBufferMs),
+        "--start-threshold-ms", ([string]$StartThresholdMs),
+        "--max-buffer-ms", ([string]$MaxBufferMs),
+        "--output-ring-ms", ([string]$OutputRingMs),
+        "--output-ring-capacity-ms", ([string]$OutputRingCapacityMs),
+        "--render-chunk-ms", ([string]$RenderChunkMs),
+        "--metrics-interval-sec", ([string]$MetricsIntervalSec)
+    )
+
+    if ($FeedbackTarget) {
+        $cargoArgs += @("--feedback-target", $FeedbackTarget)
+    }
+    if ($OutputDevice) {
+        $cargoArgs += @("--output-device", $OutputDevice)
+    }
+    if ($OutputFile) {
+        $cargoArgs += @("--output-file", $OutputFile)
+    }
+    if ($OutputBufferSizeFrames -gt 0) {
+        $cargoArgs += @("--output-buffer-size-frames", ([string]$OutputBufferSizeFrames))
+    }
+    if ($DurationSec -gt 0) {
+        $cargoArgs += @("--duration-sec", ([string]$DurationSec))
+    }
+    if ($TestTone) {
+        $cargoArgs += @("--test-tone", "--freq", ([string]$Freq))
+    }
+}
+
+& mise exec -- cargo @cargoArgs
+exit $LASTEXITCODE

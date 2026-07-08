@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
+use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24};
 use hound::{SampleFormat as WavSampleFormat, WavReader, WavSpec, WavWriter};
 use lan_audio_common::audio::{
     f32_to_i16, i16_to_f32, rms_db, stereo_to_i16_interleaved, StereoFrame, CHANNELS, SAMPLE_RATE,
@@ -633,78 +633,66 @@ fn build_input_stream(
     channels: usize,
     tx: SyncSender<Vec<StereoFrame>>,
 ) -> Result<Stream> {
-    let err_fn = |err| eprintln!("audio input stream error: {err}");
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            let tx = tx.clone();
-            device.build_input_stream(
-                *config,
-                move |data: &[f32], _| {
-                    let _ = tx.try_send(input_f32_to_stereo(data, channels));
-                },
-                err_fn,
-                None,
-            )?
-        }
-        SampleFormat::I16 => {
-            let tx = tx.clone();
-            device.build_input_stream(
-                *config,
-                move |data: &[i16], _| {
-                    let _ = tx.try_send(input_i16_to_stereo(data, channels));
-                },
-                err_fn,
-                None,
-            )?
-        }
-        SampleFormat::U16 => {
-            let tx = tx.clone();
-            device.build_input_stream(
-                *config,
-                move |data: &[u16], _| {
-                    let _ = tx.try_send(input_u16_to_stereo(data, channels));
-                },
-                err_fn,
-                None,
-            )?
+        SampleFormat::I8 => build_input_stream_for::<i8>(device, config, channels, tx)?,
+        SampleFormat::I16 => build_input_stream_for::<i16>(device, config, channels, tx)?,
+        SampleFormat::I24 => build_input_stream_for::<I24>(device, config, channels, tx)?,
+        SampleFormat::I32 => build_input_stream_for::<i32>(device, config, channels, tx)?,
+        SampleFormat::I64 => build_input_stream_for::<i64>(device, config, channels, tx)?,
+        SampleFormat::U8 => build_input_stream_for::<u8>(device, config, channels, tx)?,
+        SampleFormat::U16 => build_input_stream_for::<u16>(device, config, channels, tx)?,
+        SampleFormat::U24 => build_input_stream_for::<U24>(device, config, channels, tx)?,
+        SampleFormat::U32 => build_input_stream_for::<u32>(device, config, channels, tx)?,
+        SampleFormat::U64 => build_input_stream_for::<u64>(device, config, channels, tx)?,
+        SampleFormat::F32 => build_input_stream_for::<f32>(device, config, channels, tx)?,
+        SampleFormat::F64 => build_input_stream_for::<f64>(device, config, channels, tx)?,
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
+            bail!("DSD input sample format {sample_format:?} is not supported")
         }
         other => bail!("unsupported input sample format {other:?}"),
     };
     Ok(stream)
 }
 
-fn input_f32_to_stereo(data: &[f32], channels: usize) -> Vec<StereoFrame> {
+fn build_input_stream_for<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    channels: usize,
+    tx: SyncSender<Vec<StereoFrame>>,
+) -> Result<Stream>
+where
+    T: Sample + SizedSample + Send + 'static,
+    f32: FromSample<T>,
+{
+    let err_fn = |err| eprintln!("audio input stream error: {err}");
+    Ok(device.build_input_stream(
+        *config,
+        move |data: &[T], _| {
+            let _ = tx.try_send(input_to_stereo(data, channels));
+        },
+        err_fn,
+        None,
+    )?)
+}
+
+fn input_to_stereo<T>(data: &[T], channels: usize) -> Vec<StereoFrame>
+where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    let channels = channels.max(1);
     data.chunks_exact(channels)
         .map(|frame| {
-            let left = frame[0].clamp(-1.0, 1.0);
-            let right = frame.get(1).copied().unwrap_or(left).clamp(-1.0, 1.0);
+            let left = f32::from_sample(frame[0]).clamp(-1.0, 1.0);
+            let right = frame
+                .get(1)
+                .copied()
+                .map(f32::from_sample)
+                .unwrap_or(left)
+                .clamp(-1.0, 1.0);
             StereoFrame { left, right }
         })
         .collect()
-}
-
-fn input_i16_to_stereo(data: &[i16], channels: usize) -> Vec<StereoFrame> {
-    data.chunks_exact(channels)
-        .map(|frame| {
-            let left = i16_to_f32(frame[0]);
-            let right = frame.get(1).copied().map(i16_to_f32).unwrap_or(left);
-            StereoFrame { left, right }
-        })
-        .collect()
-}
-
-fn input_u16_to_stereo(data: &[u16], channels: usize) -> Vec<StereoFrame> {
-    data.chunks_exact(channels)
-        .map(|frame| {
-            let left = u16_to_f32(frame[0]);
-            let right = frame.get(1).copied().map(u16_to_f32).unwrap_or(left);
-            StereoFrame { left, right }
-        })
-        .collect()
-}
-
-fn u16_to_f32(sample: u16) -> f32 {
-    sample as f32 / 65535.0 * 2.0 - 1.0
 }
 
 fn select_input_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::Device> {
