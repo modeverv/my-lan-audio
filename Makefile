@@ -37,7 +37,7 @@ DIRECT_CAPTURE_QUEUE_MODE ?= fifo
 DIRECT_CAPTURE_PACKET_PACING ?= on
 DIRECT_OUTPUT_SAMPLE_RATE ?= 48000
 DIRECT_OUTPUT_BUFFER_SIZE_FRAMES ?= 32
-DIRECT_CLOCK_SYNC ?= packet
+DIRECT_CLOCK_SYNC ?= on
 LOG_DIR ?= logs
 
 FIXED_DELAY_ARG :=
@@ -105,6 +105,7 @@ help:
 	@printf '%s\n' '  DIRECT_CAPTURE_QUEUE_CAPACITY=64'
 	@printf '%s\n' '  DIRECT_CAPTURE_QUEUE_MODE=fifo'
 	@printf '%s\n' '  DIRECT_CAPTURE_PACKET_PACING=on'
+	@printf '%s\n' '  DIRECT_CLOCK_SYNC=on'
 	@printf '%s\n' '  LOG_DIR=logs'
 
 receiver:

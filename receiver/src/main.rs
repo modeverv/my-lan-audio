@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, default_value = "ring", value_parser = ["ring", "direct"])]
     audio_path: String,
 
-    #[arg(long, default_value = "off", value_parser = ["off", "packet"])]
+    #[arg(long, default_value = "off", value_parser = ["off", "packet", "on"])]
     clock_sync: String,
 
     #[arg(long)]
@@ -224,6 +224,10 @@ fn validate_audio_args(args: &Args, timing: &ReceiverTiming) -> Result<()> {
     Ok(())
 }
 
+fn clock_sync_enabled(clock_sync: &str) -> bool {
+    matches!(clock_sync, "packet" | "on")
+}
+
 fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
     let socket = bind_socket(args.listen, args.socket_recv_buffer_bytes)?;
     println!(
@@ -242,7 +246,7 @@ fn run_receiver(args: &Args, timing: ReceiverTiming) -> Result<()> {
         capacity_ms: timing.capacity_ms,
         target_ms: timing.target_buffer_ms,
         fixed_delay_frames: timing.fixed_delay_frames,
-        clock_sync: args.clock_sync == "packet",
+        clock_sync: clock_sync_enabled(&args.clock_sync),
     };
     let event_queue = Arc::new(ReceiverEventQueue::new(args.packet_queue_capacity));
     let ingress_metrics = Arc::new(IngressMetrics::default());
@@ -1737,6 +1741,13 @@ mod tests {
             fixed_delay_capacity_ms(DEFAULT_FIXED_DELAY_FRAMES, SAMPLE_RATE)
         );
         validate_audio_args(&args, &timing).unwrap();
+    }
+
+    #[test]
+    fn clock_sync_on_is_packet_sync_alias() {
+        assert!(clock_sync_enabled("on"));
+        assert!(clock_sync_enabled("packet"));
+        assert!(!clock_sync_enabled("off"));
     }
 
     #[test]

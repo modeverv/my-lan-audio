@@ -319,7 +319,7 @@ Terminal 2:
 make d-sender
 ```
 
-`d-receiver` の既定値は `DIRECT_FIXED_DELAY_FRAMES`, `DIRECT_OUTPUT_SAMPLE_RATE`, `DIRECT_OUTPUT_BUFFER_SIZE_FRAMES`, `DIRECT_CLOCK_SYNC` で調整できます。`d-sender` は `DIRECT_PACKET_MS`, `DIRECT_CAPTURE_QUEUE_CAPACITY`, `DIRECT_CAPTURE_QUEUE_MODE`, `DIRECT_CAPTURE_PACKET_PACING` で送信packet幅、capture queue容量、読み取り方式、packet pacingを調整します。既定の `DIRECT_CAPTURE_QUEUE_MODE=fifo` はcapture済みchunkを古い順に送り、`latest` は低遅延維持のために古いchunkを捨てます。`DIRECT_CAPTURE_PACKET_PACING=on` はcapture chunkを一気送信せず、`DIRECT_PACKET_MS` の間隔で1packetずつ送ります。どちらも起動時に `logs/d-receiver-YYYYmmdd-HHMMSS.log` / `logs/d-sender-YYYYmmdd-HHMMSS.log` へ build と実行ログを残します。`logs/` は git 管理外です。
+`d-receiver` の既定値は `DIRECT_FIXED_DELAY_FRAMES`, `DIRECT_OUTPUT_SAMPLE_RATE`, `DIRECT_OUTPUT_BUFFER_SIZE_FRAMES`, `DIRECT_CLOCK_SYNC` で調整できます。`DIRECT_CLOCK_SYNC=on` は packet arrival clock sync を有効にします。`packet` も同じ意味で、`off` は無効です。`d-sender` は `DIRECT_PACKET_MS`, `DIRECT_CAPTURE_QUEUE_CAPACITY`, `DIRECT_CAPTURE_QUEUE_MODE`, `DIRECT_CAPTURE_PACKET_PACING` で送信packet幅、capture queue容量、読み取り方式、packet pacingを調整します。既定の `DIRECT_CAPTURE_QUEUE_MODE=fifo` はcapture済みchunkを古い順に送り、`latest` は低遅延維持のために古いchunkを捨てます。`DIRECT_CAPTURE_PACKET_PACING=on` はcapture chunkを一気送信せず、`DIRECT_PACKET_MS` の間隔で1packetずつ送ります。どちらも起動時に `logs/d-receiver-YYYYmmdd-HHMMSS.log` / `logs/d-sender-YYYYmmdd-HHMMSS.log` へ build と実行ログを残します。`logs/` は git 管理外です。
 
 ## Windows で動かす
 
@@ -565,7 +565,7 @@ mise exec -- cargo run -p receiver -- \
 --output-device <NAME_PART>             audio output device name filter
 --output-file <PATH>                    WAV保存。指定するとwav output扱い
 --audio-path ring|direct                audio output経路。default: ring
---clock-sync off|packet                 packet arrival基準のreceiver側clock追従。default: off
+--clock-sync off|packet|on              packet arrival基準のreceiver側clock追従。on は packet と同義。default: off
 --list-devices                          出力デバイス一覧
 --test-tone                             receiver単体でtest tone出力
 --sample-rate <HZ>                      packet sample rate。現在は48000のみ
@@ -679,7 +679,7 @@ audio output では `--output-ring-ms` が固定delay内に収まる必要があ
   --fixed-latency-ms 1
 ```
 
-さらに `--clock-sync packet` を使うと、最初に受け取った packet の sample position と receiver 到着時刻を anchor にして、callback 実行時刻から playout 位置を計算します。これは PTP / NTP のようなホスト間の絶対時刻同期ではなく、receiver 内部で packet arrival clock に追従する仕組みです。
+さらに `--clock-sync on` または `--clock-sync packet` を使うと、最初に受け取った packet の sample position と receiver 到着時刻を anchor にして、callback 実行時刻から playout 位置を計算します。これは PTP / NTP のようなホスト間の絶対時刻同期ではなく、receiver 内部で packet arrival clock に追従する仕組みです。
 
 ```bash
 ./target/release/receiver \
