@@ -3,6 +3,11 @@ param(
     [string]$FeedbackListen = "",
     [string]$Device = "CABLE Output",
     [double]$PacketMs = 5.0,
+    [int]$CaptureQueueCapacity = 32,
+    [ValidateSet("latest", "fifo")]
+    [string]$CaptureQueueMode = "latest",
+    [ValidateSet("off", "on")]
+    [string]$CapturePacketPacing = "off",
     [double]$MetricsIntervalSec = 1.0,
     [double]$DurationSec = 0,
     [string]$OutputFile = "",
@@ -28,6 +33,9 @@ if ($ListDevices) {
         "--target", $Target,
         "--input", "capture",
         "--packet-ms", ([string]$PacketMs),
+        "--capture-queue-capacity", ([string]$CaptureQueueCapacity),
+        "--capture-queue-mode", $CaptureQueueMode,
+        "--capture-packet-pacing", $CapturePacketPacing,
         "--metrics-interval-sec", ([string]$MetricsIntervalSec)
     )
 
