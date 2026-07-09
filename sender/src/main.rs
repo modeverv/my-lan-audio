@@ -8,6 +8,7 @@ use lan_audio_common::resampler::StreamingLinearResampler;
 use lan_audio_common::status::ReceiverStatus;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -121,6 +122,7 @@ type SharedReceiverStatus = Arc<Mutex<Option<ReceiverStatus>>>;
 
 const DEFAULT_CAPTURE_SENDER_QUEUE_CAPACITY: usize = 32;
 const CAPTURE_PACING_MAX_CATCH_UP_PACKETS: usize = 16;
+const CAPTURE_POOL_SPARE_CHUNKS: usize = 2;
 
 #[derive(Default, Clone, Copy)]
 struct CaptureQueueSnapshot {
@@ -129,10 +131,17 @@ struct CaptureQueueSnapshot {
     lock_misses: u64,
 }
 
+struct CaptureQueueState {
+    chunks: VecDeque<Vec<StereoFrame>>,
+    free: Vec<Vec<StereoFrame>>,
+}
+
 struct CaptureQueue {
     capacity: usize,
     mode: CaptureQueueMode,
-    chunks: Mutex<VecDeque<Vec<StereoFrame>>>,
+    frame_capacity: usize,
+    pool_capacity: usize,
+    state: Arc<Mutex<CaptureQueueState>>,
     ready: Condvar,
     dropped_chunks: AtomicU64,
     dropped_frames: AtomicU64,
@@ -140,12 +149,28 @@ struct CaptureQueue {
 }
 
 impl CaptureQueue {
-    fn new(capacity: usize, mode: CaptureQueueMode) -> Self {
+    fn new(capacity: usize, mode: CaptureQueueMode, frame_capacity: usize) -> Self {
         assert!(capacity > 0, "capture queue capacity must be non-zero");
+        assert!(
+            frame_capacity > 0,
+            "capture queue frame capacity must be non-zero"
+        );
+
+        let pool_capacity = capacity.saturating_add(CAPTURE_POOL_SPARE_CHUNKS);
+        let mut free = Vec::with_capacity(pool_capacity);
+        for _ in 0..pool_capacity {
+            free.push(Vec::with_capacity(frame_capacity));
+        }
+
         Self {
             capacity,
             mode,
-            chunks: Mutex::new(VecDeque::with_capacity(capacity)),
+            frame_capacity,
+            pool_capacity,
+            state: Arc::new(Mutex::new(CaptureQueueState {
+                chunks: VecDeque::with_capacity(capacity),
+                free,
+            })),
             ready: Condvar::new(),
             dropped_chunks: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
@@ -153,44 +178,140 @@ impl CaptureQueue {
         }
     }
 
-    fn push_realtime(&self, chunk: Vec<StereoFrame>) {
-        let Ok(mut chunks) = self.chunks.try_lock() else {
+    fn push_input_realtime<T>(&self, data: &[T], channels: usize)
+    where
+        T: Sample,
+        f32: FromSample<T>,
+    {
+        let channels = channels.max(1);
+        let frames = data.len() / channels;
+        if frames == 0 {
+            return;
+        }
+        if frames > self.frame_capacity {
+            self.record_dropped_chunk_len(frames);
+            return;
+        }
+
+        let Ok(mut state) = self.state.try_lock() else {
+            self.record_dropped_chunk_len(frames);
+            self.lock_misses.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        let mut chunk = if state.chunks.len() >= self.capacity {
+            match self.mode {
+                CaptureQueueMode::Latest => {
+                    let Some(mut old) = state.chunks.pop_front() else {
+                        self.record_dropped_chunk_len(frames);
+                        return;
+                    };
+                    self.record_dropped_chunk_len(old.len());
+                    old.clear();
+                    old
+                }
+                CaptureQueueMode::Fifo => {
+                    self.record_dropped_chunk_len(frames);
+                    return;
+                }
+            }
+        } else {
+            let Some(chunk) = state.free.pop() else {
+                self.record_dropped_chunk_len(frames);
+                return;
+            };
+            chunk
+        };
+
+        if chunk.capacity() < frames {
+            self.record_dropped_chunk_len(frames);
+            self.return_free_locked(&mut state, chunk);
+            return;
+        }
+
+        chunk.clear();
+        for frame in data.chunks_exact(channels) {
+            let left = f32::from_sample(frame[0]).clamp(-1.0, 1.0);
+            let right = frame
+                .get(1)
+                .copied()
+                .map(f32::from_sample)
+                .unwrap_or(left)
+                .clamp(-1.0, 1.0);
+            chunk.push(StereoFrame { left, right });
+        }
+        state.chunks.push_back(chunk);
+        self.ready.notify_one();
+    }
+
+    #[cfg(test)]
+    fn push_realtime_for_test(&self, chunk: &[StereoFrame]) {
+        let Ok(mut state) = self.state.try_lock() else {
             self.record_dropped_chunk_len(chunk.len());
             self.lock_misses.fetch_add(1, Ordering::Relaxed);
             return;
         };
 
-        if chunks.len() >= self.capacity {
+        let mut buffer = if state.chunks.len() >= self.capacity {
             match self.mode {
                 CaptureQueueMode::Latest => {
-                    while chunks.len() >= self.capacity {
-                        if let Some(old) = chunks.pop_front() {
-                            self.record_dropped_chunk_len(old.len());
-                        }
-                    }
+                    let Some(mut old) = state.chunks.pop_front() else {
+                        self.record_dropped_chunk_len(chunk.len());
+                        return;
+                    };
+                    self.record_dropped_chunk_len(old.len());
+                    old.clear();
+                    old
                 }
                 CaptureQueueMode::Fifo => {
                     self.record_dropped_chunk_len(chunk.len());
                     return;
                 }
             }
+        } else {
+            let Some(buffer) = state.free.pop() else {
+                self.record_dropped_chunk_len(chunk.len());
+                return;
+            };
+            buffer
+        };
+
+        if buffer.capacity() < chunk.len() {
+            self.record_dropped_chunk_len(chunk.len());
+            self.return_free_locked(&mut state, buffer);
+            return;
         }
-        chunks.push_back(chunk);
+
+        buffer.clear();
+        buffer.extend_from_slice(chunk);
+        state.chunks.push_back(buffer);
         self.ready.notify_one();
     }
 
-    fn recv_timeout(&self, timeout: Duration) -> Option<Vec<StereoFrame>> {
-        let mut chunks = self.chunks.lock().ok()?;
-        if chunks.is_empty() {
-            let Ok((guard, result)) = self.ready.wait_timeout(chunks, timeout) else {
+    fn recv_timeout(&self, timeout: Duration) -> Option<CaptureChunk> {
+        let mut state = self.state.lock().ok()?;
+        if state.chunks.is_empty() {
+            let Ok((guard, result)) = self.ready.wait_timeout(state, timeout) else {
                 return None;
             };
-            chunks = guard;
-            if result.timed_out() && chunks.is_empty() {
+            state = guard;
+            if result.timed_out() && state.chunks.is_empty() {
                 return None;
             }
         }
-        chunks.pop_front()
+        state.chunks.pop_front().map(|frames| CaptureChunk {
+            frames: Some(frames),
+            state: Arc::clone(&self.state),
+            frame_capacity: self.frame_capacity,
+            pool_capacity: self.pool_capacity,
+        })
+    }
+
+    fn return_free_locked(&self, state: &mut CaptureQueueState, mut chunk: Vec<StereoFrame>) {
+        chunk.clear();
+        if chunk.capacity() >= self.frame_capacity && state.free.len() < self.pool_capacity {
+            state.free.push(chunk);
+        }
     }
 
     fn snapshot(&self) -> CaptureQueueSnapshot {
@@ -205,6 +326,39 @@ impl CaptureQueue {
         self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
         self.dropped_frames
             .fetch_add(frames as u64, Ordering::Relaxed);
+    }
+}
+
+struct CaptureChunk {
+    frames: Option<Vec<StereoFrame>>,
+    state: Arc<Mutex<CaptureQueueState>>,
+    frame_capacity: usize,
+    pool_capacity: usize,
+}
+
+impl Deref for CaptureChunk {
+    type Target = [StereoFrame];
+
+    fn deref(&self) -> &Self::Target {
+        self.frames.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for CaptureChunk {
+    fn drop(&mut self) {
+        let Some(mut frames) = self.frames.take() else {
+            return;
+        };
+        frames.clear();
+        if frames.capacity() < self.frame_capacity {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.free.len() < self.pool_capacity {
+            state.free.push(frames);
+        }
     }
 }
 
@@ -636,11 +790,21 @@ fn open_capture_stream(
     let config = supported.config();
     let source_rate = config.sample_rate;
     let source_channels = config.channels as usize;
-    let capture_queue = Arc::new(CaptureQueue::new(queue_capacity, args.capture_queue_mode));
+    let capture_frame_capacity = capture_frame_capacity_for_stream(&config);
+    let capture_queue = Arc::new(CaptureQueue::new(
+        queue_capacity,
+        args.capture_queue_mode,
+        capture_frame_capacity,
+    ));
 
     println!(
-        "selected_device=\"{}\" input_format={}Hz/{}ch/{:?}",
-        device_name, source_rate, source_channels, sample_format
+        "selected_device=\"{}\" input_format={}Hz/{}ch/{:?} capture_pool_chunks={} capture_pool_frames={}",
+        device_name,
+        source_rate,
+        source_channels,
+        sample_format,
+        queue_capacity.saturating_add(CAPTURE_POOL_SPARE_CHUNKS),
+        capture_frame_capacity
     );
 
     let stream = build_input_stream(
@@ -715,31 +879,20 @@ where
     Ok(device.build_input_stream(
         *config,
         move |data: &[T], _| {
-            capture_queue.push_realtime(input_to_stereo(data, channels));
+            capture_queue.push_input_realtime(data, channels);
         },
         err_fn,
         None,
     )?)
 }
 
-fn input_to_stereo<T>(data: &[T], channels: usize) -> Vec<StereoFrame>
-where
-    T: Sample,
-    f32: FromSample<T>,
-{
-    let channels = channels.max(1);
-    data.chunks_exact(channels)
-        .map(|frame| {
-            let left = f32::from_sample(frame[0]).clamp(-1.0, 1.0);
-            let right = frame
-                .get(1)
-                .copied()
-                .map(f32::from_sample)
-                .unwrap_or(left)
-                .clamp(-1.0, 1.0);
-            StereoFrame { left, right }
-        })
-        .collect()
+fn capture_frame_capacity_for_stream(config: &StreamConfig) -> usize {
+    match config.buffer_size {
+        cpal::BufferSize::Fixed(frames) => usize::try_from(frames).unwrap_or(usize::MAX),
+        cpal::BufferSize::Default => {
+            (usize::try_from(config.sample_rate).unwrap_or(48_000) / 2).max(2048)
+        }
+    }
 }
 
 fn select_input_device(host: &cpal::Host, filter: Option<&str>) -> Result<cpal::Device> {
@@ -814,11 +967,11 @@ mod tests {
 
     #[test]
     fn latest_capture_queue_drops_oldest_when_full() {
-        let queue = CaptureQueue::new(2, CaptureQueueMode::Latest);
+        let queue = CaptureQueue::new(2, CaptureQueueMode::Latest, 64);
 
-        queue.push_realtime(chunk(1.0, 10));
-        queue.push_realtime(chunk(2.0, 20));
-        queue.push_realtime(chunk(3.0, 30));
+        queue.push_realtime_for_test(&chunk(1.0, 10));
+        queue.push_realtime_for_test(&chunk(2.0, 20));
+        queue.push_realtime_for_test(&chunk(3.0, 30));
 
         let first = queue.recv_timeout(Duration::from_millis(0)).unwrap();
         assert_eq!(first[0].left, 2.0);
@@ -830,11 +983,11 @@ mod tests {
 
     #[test]
     fn capture_queue_fifo_recv_preserves_backlog() {
-        let queue = CaptureQueue::new(4, CaptureQueueMode::Fifo);
+        let queue = CaptureQueue::new(4, CaptureQueueMode::Fifo, 64);
 
-        queue.push_realtime(chunk(1.0, 10));
-        queue.push_realtime(chunk(2.0, 20));
-        queue.push_realtime(chunk(3.0, 30));
+        queue.push_realtime_for_test(&chunk(1.0, 10));
+        queue.push_realtime_for_test(&chunk(2.0, 20));
+        queue.push_realtime_for_test(&chunk(3.0, 30));
 
         let first = queue.recv_timeout(Duration::from_millis(0)).unwrap();
         let second = queue.recv_timeout(Duration::from_millis(0)).unwrap();
@@ -851,11 +1004,11 @@ mod tests {
 
     #[test]
     fn fifo_capture_queue_drops_newest_when_full() {
-        let queue = CaptureQueue::new(2, CaptureQueueMode::Fifo);
+        let queue = CaptureQueue::new(2, CaptureQueueMode::Fifo, 64);
 
-        queue.push_realtime(chunk(1.0, 10));
-        queue.push_realtime(chunk(2.0, 20));
-        queue.push_realtime(chunk(3.0, 30));
+        queue.push_realtime_for_test(&chunk(1.0, 10));
+        queue.push_realtime_for_test(&chunk(2.0, 20));
+        queue.push_realtime_for_test(&chunk(3.0, 30));
 
         let first = queue.recv_timeout(Duration::from_millis(0)).unwrap();
         let second = queue.recv_timeout(Duration::from_millis(0)).unwrap();
@@ -867,5 +1020,42 @@ mod tests {
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.dropped_chunks, 1);
         assert_eq!(snapshot.dropped_frames, 30);
+    }
+
+    #[test]
+    fn capture_queue_drops_when_pool_is_empty() {
+        let queue = CaptureQueue::new(4, CaptureQueueMode::Fifo, 64);
+
+        queue.push_realtime_for_test(&chunk(1.0, 10));
+        queue.push_realtime_for_test(&chunk(2.0, 10));
+        queue.push_realtime_for_test(&chunk(3.0, 10));
+        queue.push_realtime_for_test(&chunk(4.0, 10));
+
+        let _held = [
+            queue.recv_timeout(Duration::from_millis(0)).unwrap(),
+            queue.recv_timeout(Duration::from_millis(0)).unwrap(),
+            queue.recv_timeout(Duration::from_millis(0)).unwrap(),
+            queue.recv_timeout(Duration::from_millis(0)).unwrap(),
+        ];
+        queue.push_realtime_for_test(&chunk(5.0, 10));
+        queue.push_realtime_for_test(&chunk(6.0, 10));
+        queue.push_realtime_for_test(&chunk(7.0, 10));
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.dropped_chunks, 1);
+        assert_eq!(snapshot.dropped_frames, 10);
+    }
+
+    #[test]
+    fn capture_queue_drops_chunks_larger_than_preallocated_capacity() {
+        let queue = CaptureQueue::new(2, CaptureQueueMode::Fifo, 2);
+        let samples = [0.25f32, 0.25, 0.5, 0.5, 0.75, 0.75];
+
+        queue.push_input_realtime(&samples, 2);
+
+        assert!(queue.recv_timeout(Duration::from_millis(0)).is_none());
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.dropped_chunks, 1);
+        assert_eq!(snapshot.dropped_frames, 3);
     }
 }
