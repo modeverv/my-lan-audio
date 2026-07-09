@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_FIXED_DELAY_FRAMES: u64 = 14_400;
 const FIXED_LATENCY_MIN_CAPACITY_MS: u32 = 600;
+const BUFFER_SAMPLE_CAPACITY: usize = 8_192;
 
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP receiver")]
@@ -271,6 +272,7 @@ struct IngressMetrics {
     queued_invalid_packets: AtomicU64,
     queue_drops: AtomicU64,
     sources: Mutex<IngressSources>,
+    timing: Mutex<IngressTiming>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -285,6 +287,14 @@ struct IngressSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct IngressTimingSnapshot {
+    arrival_gap_count: u64,
+    arrival_gap_max: Duration,
+    send_gap_count: u64,
+    send_gap_max: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct IngressSources {
     active_stream_id: Option<u64>,
     active_source: Option<SocketAddr>,
@@ -292,9 +302,53 @@ struct IngressSources {
     foreign_source: Option<SocketAddr>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct IngressTiming {
+    latest_arrival: Option<Instant>,
+    arrival_gap_count: u64,
+    arrival_gap_max: Duration,
+    latest_send_stream_id: Option<u64>,
+    latest_send_source: Option<SocketAddr>,
+    latest_send_time_ns: Option<u64>,
+    send_gap_count: u64,
+    send_gap_max: Duration,
+}
+
 impl IngressMetrics {
     fn record_packet_queued(&self) {
         self.queued_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_packet_timing(&self, packet: &AudioPacket, source: SocketAddr, arrival: Instant) {
+        let Ok(mut timing) = self.timing.try_lock() else {
+            return;
+        };
+        if let Some(previous) = timing.latest_arrival {
+            if let Some(gap) = arrival.checked_duration_since(previous) {
+                timing.arrival_gap_count += 1;
+                timing.arrival_gap_max = timing.arrival_gap_max.max(gap);
+            }
+        }
+        timing.latest_arrival = Some(arrival);
+
+        let same_sender = timing.latest_send_stream_id == Some(packet.header.stream_id)
+            && timing.latest_send_source == Some(source);
+        if same_sender {
+            if let Some(previous_send_time_ns) = timing.latest_send_time_ns {
+                if packet.header.send_time_ns >= previous_send_time_ns {
+                    let gap_ns = packet.header.send_time_ns - previous_send_time_ns;
+                    timing.send_gap_count += 1;
+                    timing.send_gap_max = timing.send_gap_max.max(Duration::from_nanos(gap_ns));
+                    timing.latest_send_time_ns = Some(packet.header.send_time_ns);
+                }
+            } else {
+                timing.latest_send_time_ns = Some(packet.header.send_time_ns);
+            }
+        } else {
+            timing.latest_send_stream_id = Some(packet.header.stream_id);
+            timing.latest_send_source = Some(source);
+            timing.latest_send_time_ns = Some(packet.header.send_time_ns);
+        }
     }
 
     fn record_invalid_queued(&self) {
@@ -343,6 +397,23 @@ impl IngressMetrics {
             foreign_source: sources.foreign_source,
         }
     }
+
+    fn take_timing_snapshot(&self) -> IngressTimingSnapshot {
+        let Ok(mut timing) = self.timing.lock() else {
+            return IngressTimingSnapshot::default();
+        };
+        let snapshot = IngressTimingSnapshot {
+            arrival_gap_count: timing.arrival_gap_count,
+            arrival_gap_max: timing.arrival_gap_max,
+            send_gap_count: timing.send_gap_count,
+            send_gap_max: timing.send_gap_max,
+        };
+        timing.arrival_gap_count = 0;
+        timing.arrival_gap_max = Duration::ZERO;
+        timing.send_gap_count = 0;
+        timing.send_gap_max = Duration::ZERO;
+        snapshot
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -352,32 +423,48 @@ struct ReceiverSnapshot {
 }
 
 struct ReceiverState {
-    snapshot: Mutex<ReceiverSnapshot>,
+    inner: Mutex<ReceiverStateInner>,
+}
+
+struct ReceiverStateInner {
+    snapshot: ReceiverSnapshot,
+    buffer_samples: Vec<u64>,
 }
 
 impl ReceiverState {
     fn new(target_ms: u32) -> Self {
         Self {
-            snapshot: Mutex::new(ReceiverSnapshot {
-                metrics: JitterMetrics::default(),
-                target_ms,
+            inner: Mutex::new(ReceiverStateInner {
+                snapshot: ReceiverSnapshot {
+                    metrics: JitterMetrics::default(),
+                    target_ms,
+                },
+                buffer_samples: Vec::with_capacity(BUFFER_SAMPLE_CAPACITY),
             }),
         }
     }
 
     fn publish(&self, jitter: &JitterBuffer) {
-        let Ok(mut snapshot) = self.snapshot.try_lock() else {
+        let Ok(mut inner) = self.inner.try_lock() else {
             return;
         };
-        snapshot.metrics = jitter.metrics();
-        snapshot.target_ms = jitter.target_ms();
+        let metrics = jitter.metrics();
+        if inner.buffer_samples.len() < BUFFER_SAMPLE_CAPACITY {
+            inner.buffer_samples.push(metrics.buffer_level_frames);
+        }
+        inner.snapshot.metrics = metrics;
+        inner.snapshot.target_ms = jitter.target_ms();
     }
 
-    fn snapshot(&self) -> Option<ReceiverSnapshot> {
-        self.snapshot
-            .try_lock()
-            .ok()
-            .map(|snapshot| snapshot.clone())
+    fn snapshot_and_take_buffer_samples(&self) -> Option<(ReceiverSnapshot, Vec<u64>)> {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return None;
+        };
+        let samples = std::mem::replace(
+            &mut inner.buffer_samples,
+            Vec::with_capacity(BUFFER_SAMPLE_CAPACITY),
+        );
+        Some((inner.snapshot.clone(), samples))
     }
 }
 
@@ -394,6 +481,7 @@ fn spawn_udp_receiver(
                     let arrival = Instant::now();
                     match AudioPacket::from_bytes(&buf[..len]) {
                         Ok(packet) => {
+                            ingress_metrics.record_packet_timing(&packet, source, arrival);
                             send_receiver_event(
                                 &event_queue,
                                 ReceiverEvent::Packet(packet, source, arrival),
@@ -704,6 +792,47 @@ impl OutputCallbackMetrics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BufferWindowStats {
+    sample_count: usize,
+    min_frames: u64,
+    p05_frames: u64,
+    p50_frames: u64,
+    p95_frames: u64,
+}
+
+fn buffer_window_stats(mut samples: Vec<u64>, fallback_frames: u64) -> BufferWindowStats {
+    if samples.is_empty() {
+        return BufferWindowStats {
+            sample_count: 0,
+            min_frames: fallback_frames,
+            p05_frames: fallback_frames,
+            p50_frames: fallback_frames,
+            p95_frames: fallback_frames,
+        };
+    }
+
+    samples.sort_unstable();
+    BufferWindowStats {
+        sample_count: samples.len(),
+        min_frames: samples[0],
+        p05_frames: percentile_nearest_rank(&samples, 0.05),
+        p50_frames: percentile_nearest_rank(&samples, 0.50),
+        p95_frames: percentile_nearest_rank(&samples, 0.95),
+    }
+}
+
+fn percentile_nearest_rank(sorted_samples: &[u64], percentile: f64) -> u64 {
+    if sorted_samples.is_empty() {
+        return 0;
+    }
+    let percentile = percentile.clamp(0.0, 1.0);
+    let index = ((sorted_samples.len() as f64 * percentile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted_samples.len() - 1);
+    sorted_samples[index]
+}
+
 struct FeedbackSender {
     socket: UdpSocket,
     target: SocketAddr,
@@ -776,12 +905,16 @@ impl MetricsPrinter {
         if self.last.elapsed() < self.interval {
             return;
         }
-        let Some(snapshot) = self.receiver_state.snapshot() else {
+        let Some((snapshot, buffer_samples)) =
+            self.receiver_state.snapshot_and_take_buffer_samples()
+        else {
             return;
         };
         let metrics = snapshot.metrics;
         let target_ms = snapshot.target_ms;
         let ingress = self.ingress_metrics.snapshot();
+        let ingress_timing = self.ingress_metrics.take_timing_snapshot();
+        let buffer_stats = buffer_window_stats(buffer_samples, metrics.buffer_level_frames);
 
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let previous = self.last_metrics.clone().unwrap_or_default();
@@ -822,12 +955,18 @@ impl MetricsPrinter {
         let total_buffered_ms = frames_to_ms_f64(total_buffered_frames, SAMPLE_RATE);
         let fixed_delay_frames = metrics.fixed_delay_frames;
         let fixed_delay_ms = frames_to_ms_f64(fixed_delay_frames, SAMPLE_RATE);
+        let buffer_min_ms = frames_to_ms_f64(buffer_stats.min_frames, SAMPLE_RATE);
+        let buffer_p05_ms = frames_to_ms_f64(buffer_stats.p05_frames, SAMPLE_RATE);
+        let buffer_p50_ms = frames_to_ms_f64(buffer_stats.p50_frames, SAMPLE_RATE);
+        let buffer_p95_ms = frames_to_ms_f64(buffer_stats.p95_frames, SAMPLE_RATE);
+        let arrival_gap_max_ms = ingress_timing.arrival_gap_max.as_secs_f64() * 1000.0;
+        let send_gap_max_ms = ingress_timing.send_gap_max.as_secs_f64() * 1000.0;
         let active_source = format_source(ingress.active_source);
         let active_stream = format_stream_id(ingress.active_stream_id);
         let foreign_source = format_source(ingress.foreign_source);
         let foreign_stream = format_stream_id(ingress.foreign_stream_id);
         println!(
-            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s foreign={:.1}/s src={} stream={} foreign_src={} foreign_stream={} buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
+            "receiver: state={:?} packets={:.1}/s queued={:.1}/s qdrop={:.1}/s qinvalid={:.1}/s loss={:.1}/s late={:.1}/s dup={:.1}/s ooo={:.1}/s foreign={:.1}/s src={} stream={} foreign_src={} foreign_stream={} buf={}fr/{:.1}ms fixed={}fr/{:.1}ms outq={}fr/{:.1}ms total_buf={}fr/{:.1}ms buf_n={} buf_min={}fr/{:.1}ms buf_p05={}fr/{:.1}ms buf_p50={}fr/{:.1}ms buf_p95={}fr/{:.1}ms arrival_gap_max={:.2}ms arrival_gap_n={} send_gap_max={:.2}ms send_gap_n={} device_ratio={:.6} ratio={:.6} drift={:.1}ppm startup_under={} steady_under={} missing_calls={:.1}/s missing_frames={:.0}/s cb={:.1}/s out_frames={:.0}/s scratch_overflow={:.1}/s resyncs={} stream_resyncs={} underrun_resyncs={}",
             metrics.state,
             (metrics.received_packets - previous.received_packets) as f64 / elapsed,
             queued_packet_delta as f64 / elapsed,
@@ -850,6 +989,19 @@ impl MetricsPrinter {
             output_queue_ms,
             total_buffered_frames,
             total_buffered_ms,
+            buffer_stats.sample_count,
+            buffer_stats.min_frames,
+            buffer_min_ms,
+            buffer_stats.p05_frames,
+            buffer_p05_ms,
+            buffer_stats.p50_frames,
+            buffer_p50_ms,
+            buffer_stats.p95_frames,
+            buffer_p95_ms,
+            arrival_gap_max_ms,
+            ingress_timing.arrival_gap_count,
+            send_gap_max_ms,
+            ingress_timing.send_gap_count,
             metrics.device_resample_ratio,
             metrics.effective_resample_ratio,
             metrics.estimated_drift_ppm,
@@ -1050,5 +1202,89 @@ mod tests {
         let mut events = Vec::new();
         queue.drain_into(&mut events);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn buffer_window_stats_reports_min_and_percentiles() {
+        let stats = buffer_window_stats(vec![100, 50, 200, 150, 125], 999);
+
+        assert_eq!(stats.sample_count, 5);
+        assert_eq!(stats.min_frames, 50);
+        assert_eq!(stats.p05_frames, 50);
+        assert_eq!(stats.p50_frames, 125);
+        assert_eq!(stats.p95_frames, 200);
+    }
+
+    #[test]
+    fn buffer_window_stats_uses_fallback_without_samples() {
+        let stats = buffer_window_stats(Vec::new(), 321);
+
+        assert_eq!(stats.sample_count, 0);
+        assert_eq!(stats.min_frames, 321);
+        assert_eq!(stats.p05_frames, 321);
+        assert_eq!(stats.p50_frames, 321);
+        assert_eq!(stats.p95_frames, 321);
+    }
+
+    #[test]
+    fn ingress_timing_snapshot_reports_and_resets_gap_window() {
+        let ingress = IngressMetrics::default();
+        let t0 = Instant::now();
+        let source: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+
+        ingress.record_packet_timing(&test_packet_with_send_time(1, 0), source, t0);
+        ingress.record_packet_timing(
+            &test_packet_with_send_time(2, 1_000_000),
+            source,
+            t0 + Duration::from_millis(1),
+        );
+        ingress.record_packet_timing(
+            &test_packet_with_send_time(3, 4_000_000),
+            source,
+            t0 + Duration::from_millis(4),
+        );
+
+        let first = ingress.take_timing_snapshot();
+        assert_eq!(first.arrival_gap_count, 2);
+        assert_eq!(first.arrival_gap_max, Duration::from_millis(3));
+        assert_eq!(first.send_gap_count, 2);
+        assert_eq!(first.send_gap_max, Duration::from_millis(3));
+
+        let second = ingress.take_timing_snapshot();
+        assert_eq!(second.arrival_gap_count, 0);
+        assert_eq!(second.arrival_gap_max, Duration::ZERO);
+        assert_eq!(second.send_gap_count, 0);
+        assert_eq!(second.send_gap_max, Duration::ZERO);
+    }
+
+    #[test]
+    fn ingress_send_gap_ignores_reordered_packet_time() {
+        let ingress = IngressMetrics::default();
+        let source: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let t0 = Instant::now();
+
+        ingress.record_packet_timing(&test_packet_with_send_time(1, 10_000_000), source, t0);
+        ingress.record_packet_timing(
+            &test_packet_with_send_time(0, 9_000_000),
+            source,
+            t0 + Duration::from_millis(1),
+        );
+        ingress.record_packet_timing(
+            &test_packet_with_send_time(2, 11_000_000),
+            source,
+            t0 + Duration::from_millis(2),
+        );
+
+        let snapshot = ingress.take_timing_snapshot();
+        assert_eq!(snapshot.arrival_gap_count, 2);
+        assert_eq!(snapshot.arrival_gap_max, Duration::from_millis(1));
+        assert_eq!(snapshot.send_gap_count, 1);
+        assert_eq!(snapshot.send_gap_max, Duration::from_millis(1));
+    }
+
+    fn test_packet_with_send_time(sequence: u32, send_time_ns: u64) -> AudioPacket {
+        let header =
+            lan_audio_common::packet::AudioPacketHeader::new(7, sequence, 1, 0, send_time_ns);
+        AudioPacket::new(header, vec![0, 0]).unwrap()
     }
 }

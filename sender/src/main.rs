@@ -7,12 +7,15 @@ use lan_audio_common::packet::{AudioPacketHeader, HEADER_SIZE, MAGIC};
 use lan_audio_common::resampler::StreamingLinearResampler;
 use lan_audio_common::status::ReceiverStatus;
 use std::collections::VecDeque;
+use std::hint;
 use std::net::{SocketAddr, UdpSocket};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use windows_sys::Win32::Media::Multimedia::{timeBeginPeriod, timeEndPeriod};
 
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP sender")]
@@ -116,13 +119,58 @@ struct SendStats {
     sent_packets: u64,
     sent_bytes: u64,
     send_errors: u64,
+    pacing_dropped_frames: u64,
 }
 
 type SharedReceiverStatus = Arc<Mutex<Option<ReceiverStatus>>>;
 
 const DEFAULT_CAPTURE_SENDER_QUEUE_CAPACITY: usize = 32;
-const CAPTURE_PACING_MAX_CATCH_UP_PACKETS: usize = 16;
+const CAPTURE_PACING_MAX_CATCH_UP_PACKETS: usize = 4;
+const CAPTURE_UNPACED_MAX_BURST_PACKETS: usize = 16;
+const CAPTURE_PACING_SPIN_US: u64 = 200;
 const CAPTURE_POOL_SPARE_CHUNKS: usize = 2;
+
+struct TimerResolutionGuard {
+    #[cfg(windows)]
+    enabled: bool,
+}
+
+impl TimerResolutionGuard {
+    fn request_1ms(enabled: bool) -> Self {
+        #[cfg(windows)]
+        {
+            if !enabled {
+                return Self { enabled: false };
+            }
+
+            let result = unsafe { timeBeginPeriod(1) };
+            if result == 0 {
+                println!("sender: windows_timer_resolution=1ms");
+                Self { enabled: true }
+            } else {
+                eprintln!("sender: failed to request 1ms Windows timer resolution: {result}");
+                Self { enabled: false }
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = enabled;
+            Self {}
+        }
+    }
+}
+
+impl Drop for TimerResolutionGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.enabled {
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 struct CaptureQueueSnapshot {
@@ -466,6 +514,7 @@ struct MetricsPrinter {
     last: Instant,
     last_packets: u64,
     last_bytes: u64,
+    last_pacing_dropped_frames: u64,
     remote_status: Option<SharedReceiverStatus>,
     capture_queue: Option<Arc<CaptureQueue>>,
     last_capture_queue: CaptureQueueSnapshot,
@@ -482,6 +531,7 @@ impl MetricsPrinter {
             last: Instant::now(),
             last_packets: 0,
             last_bytes: 0,
+            last_pacing_dropped_frames: 0,
             remote_status,
             capture_queue,
             last_capture_queue: CaptureQueueSnapshot::default(),
@@ -503,11 +553,15 @@ impl MetricsPrinter {
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let packets = sender.stats.sent_packets - self.last_packets;
         let bytes = sender.stats.sent_bytes - self.last_bytes;
+        let pacing_dropped_frames = sender
+            .stats
+            .pacing_dropped_frames
+            .saturating_sub(self.last_pacing_dropped_frames);
         let bitrate_mbps = bytes as f64 * 8.0 / elapsed / 1_000_000.0;
         let capture_suffix = self.capture_suffix(elapsed);
         let remote_suffix = self.remote_suffix();
         println!(
-            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB errors={} send_corr={:.1}ppm{}{}",
+            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB errors={} send_corr={:.1}ppm pacing_drop_frames={:.0}/s{}{}",
             packets as f64 / elapsed,
             bitrate_mbps,
             sender.sequence,
@@ -517,6 +571,7 @@ impl MetricsPrinter {
             rms.1,
             sender.stats.send_errors,
             send_rate_ppm,
+            pacing_dropped_frames as f64 / elapsed,
             capture_suffix,
             remote_suffix
         );
@@ -524,6 +579,7 @@ impl MetricsPrinter {
         self.last = Instant::now();
         self.last_packets = sender.stats.sent_packets;
         self.last_bytes = sender.stats.sent_bytes;
+        self.last_pacing_dropped_frames = sender.stats.pacing_dropped_frames;
     }
 
     fn capture_suffix(&mut self, elapsed: f64) -> String {
@@ -685,6 +741,7 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
         args.capture_queue_mode.as_str(),
         args.capture_packet_pacing.as_str()
     );
+    let _timer_resolution = TimerResolutionGuard::request_1ms(args.capture_packet_pacing.enabled());
     let mut resampler = StreamingLinearResampler::new(source_rate, args.sample_rate);
     let mut sender = PacketSender::new(args)?;
     let mut metrics = MetricsPrinter::new(
@@ -705,64 +762,72 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
 
         let send_rate_ppm = sender_side_asrc_ppm(args, &remote_status);
         let interval = packet_interval(args, send_rate_ppm);
-        let now = Instant::now();
+        if args.capture_packet_pacing.enabled() && pending.len() >= packet_frames {
+            let now = Instant::now();
+            let max_lag = interval.mul_f64(CAPTURE_PACING_MAX_CATCH_UP_PACKETS as f64);
+            if now.saturating_duration_since(next_packet_deadline) > max_lag {
+                let dropped = trim_pending_to_latest_packets(
+                    &mut pending,
+                    packet_frames,
+                    CAPTURE_PACING_MAX_CATCH_UP_PACKETS,
+                );
+                sender.stats.pacing_dropped_frames += dropped as u64;
+                next_packet_deadline = now;
+            }
+
+            let mut sent_packets = 0usize;
+            while pending.len() >= packet_frames && Instant::now() >= next_packet_deadline {
+                sender.send_frames(&pending[..packet_frames])?;
+                pending.drain(..packet_frames);
+                next_packet_deadline += interval;
+                sent_packets += 1;
+                if sent_packets >= CAPTURE_PACING_MAX_CATCH_UP_PACKETS {
+                    if pending.len() >= packet_frames && Instant::now() >= next_packet_deadline {
+                        let dropped = trim_pending_to_latest_packets(
+                            &mut pending,
+                            packet_frames,
+                            CAPTURE_PACING_MAX_CATCH_UP_PACKETS,
+                        );
+                        sender.stats.pacing_dropped_frames += dropped as u64;
+                        next_packet_deadline = Instant::now() + interval;
+                    }
+                    break;
+                }
+            }
+
+            if sent_packets > 0 {
+                let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
+                metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+                continue;
+            }
+
+            wait_until_packet_deadline(next_packet_deadline);
+            continue;
+        }
+
         if pending.len() >= packet_frames {
-            if args.capture_packet_pacing.enabled() {
-                let max_lag = interval.mul_f64(CAPTURE_PACING_MAX_CATCH_UP_PACKETS as f64);
-                if now.saturating_duration_since(next_packet_deadline) > max_lag {
-                    let keep_frames = packet_frames * CAPTURE_PACING_MAX_CATCH_UP_PACKETS;
-                    if pending.len() > keep_frames {
-                        pending.drain(..pending.len() - keep_frames);
-                    }
-                    next_packet_deadline = now;
+            let mut sent_packets = 0usize;
+            while pending.len() >= packet_frames {
+                sender.send_frames(&pending[..packet_frames])?;
+                pending.drain(..packet_frames);
+                sent_packets += 1;
+                if sent_packets >= CAPTURE_UNPACED_MAX_BURST_PACKETS {
+                    break;
                 }
+            }
 
-                let mut sent_packets = 0usize;
-                while pending.len() >= packet_frames && Instant::now() >= next_packet_deadline {
-                    sender.send_frames(&pending[..packet_frames])?;
-                    pending.drain(..packet_frames);
-                    next_packet_deadline += interval;
-                    sent_packets += 1;
-                    if sent_packets >= CAPTURE_PACING_MAX_CATCH_UP_PACKETS {
-                        break;
-                    }
-                }
-
-                if sent_packets > 0 {
-                    let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-                    metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
-                    continue;
-                }
-            } else {
-                let mut sent_packets = 0usize;
-                while pending.len() >= packet_frames {
-                    sender.send_frames(&pending[..packet_frames])?;
-                    pending.drain(..packet_frames);
-                    sent_packets += 1;
-                    if sent_packets >= CAPTURE_PACING_MAX_CATCH_UP_PACKETS {
-                        break;
-                    }
-                }
-
-                if sent_packets > 0 {
-                    let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-                    metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
-                    continue;
-                }
+            if sent_packets > 0 {
+                let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
+                metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+                continue;
             }
         }
 
-        let capture_timeout =
-            if args.capture_packet_pacing.enabled() && pending.len() >= packet_frames {
-                next_packet_deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(100))
-            } else {
-                Duration::from_millis(100)
-            };
+        let capture_timeout = Duration::from_millis(100);
         let captured = capture_queue.recv_timeout(capture_timeout);
 
         if let Some(chunk) = captured {
+            let pending_was_ready = pending.len() >= packet_frames;
             latest_rms = rms_db(&chunk);
             let effective_target_rate =
                 args.sample_rate as f64 * (1.0 + send_rate_ppm / 1_000_000.0).max(0.0001);
@@ -770,6 +835,12 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
             resampled.clear();
             resampler.push(&chunk, &mut resampled);
             pending.extend_from_slice(&resampled);
+            if args.capture_packet_pacing.enabled()
+                && !pending_was_ready
+                && pending.len() >= packet_frames
+            {
+                next_packet_deadline = Instant::now();
+            }
         }
         let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
         metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
@@ -937,6 +1008,39 @@ fn packet_interval(args: &Args, send_rate_ppm: f64) -> Duration {
     Duration::from_secs_f64(nominal / speed.max(0.0001))
 }
 
+fn wait_until_packet_deadline(deadline: Instant) {
+    let spin_window = Duration::from_micros(CAPTURE_PACING_SPIN_US);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline.duration_since(now);
+        if remaining > spin_window {
+            thread::sleep(remaining.saturating_sub(spin_window));
+            continue;
+        }
+        while Instant::now() < deadline {
+            hint::spin_loop();
+        }
+        return;
+    }
+}
+
+fn trim_pending_to_latest_packets(
+    pending: &mut Vec<StereoFrame>,
+    packet_frames: usize,
+    keep_packets: usize,
+) -> usize {
+    let keep_frames = packet_frames.saturating_mul(keep_packets);
+    if pending.len() <= keep_frames {
+        return 0;
+    }
+    let drop_frames = pending.len() - keep_frames;
+    pending.drain(..drop_frames);
+    drop_frames
+}
+
 fn duration_elapsed(start: Instant, duration_sec: Option<f64>) -> bool {
     duration_sec
         .map(|duration| start.elapsed() >= Duration::from_secs_f64(duration.max(0.0)))
@@ -963,6 +1067,23 @@ mod tests {
             };
             frames
         ]
+    }
+
+    #[test]
+    fn trim_pending_to_latest_packets_drops_oldest_frames() {
+        let mut pending: Vec<StereoFrame> = (0..10)
+            .map(|value| StereoFrame {
+                left: value as f32,
+                right: value as f32,
+            })
+            .collect();
+
+        let dropped = trim_pending_to_latest_packets(&mut pending, 2, 3);
+
+        assert_eq!(dropped, 4);
+        assert_eq!(pending.len(), 6);
+        assert_eq!(pending[0].left, 4.0);
+        assert_eq!(pending[5].left, 9.0);
     }
 
     #[test]
