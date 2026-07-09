@@ -501,6 +501,7 @@ mise exec -- cargo run -p sender -- \
 --capture-queue-capacity <N>     live capture chunk queue容量。default: 32
 --capture-queue-mode latest|fifo live capture queue読み取り方式。default: latest
 --capture-packet-pacing off|on   live capture packet送信をpacket-ms間隔へ整形。default: off
+--input-buffer-size-frames <N>   CPAL input stream buffer sizeを固定指定。未指定ならbackend default
 --sender-side-asrc               receiver feedbackでsender送出レートを微調整
 --sender-asrc-kp <K>             sender-side ASRCの比例係数
 --sender-asrc-max-ppm <PPM>      sender-side ASRC補正上限
@@ -603,6 +604,8 @@ sender: input=capture packets=200.0/s bitrate=1.619Mbps sequence=...
 - `capture_qdrop`: sender live capture queue で低遅延維持のために捨てた古いchunk
 - `capture_qdrop_frames`: 捨てたcapture frame数
 - `capture_lock_miss`: capture callback が queue lock を取れず chunk を捨てた回数
+- `capture_callback_gap_max`: capture callback 間隔の区間内最大値
+- `packet_dispatch_gap_max`: sender が UDP packet を dispatch した間隔の区間内最大値
 - `remote_buf`: receiver の jitter buffer 水位
 - `remote_outq`: receiver の output ring 水位
 - `remote_total`: receiver 内部の合算 buffer 水位

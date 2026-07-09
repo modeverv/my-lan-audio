@@ -7,5 +7,5 @@ version.workspace = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-cpal = "0.18"
+cpal = { version = "0.18", features = ["realtime"] }
 lan-audio-common = { path = "../common" }

@@ -8,6 +8,7 @@ param(
     [string]$CaptureQueueMode = "latest",
     [ValidateSet("off", "on")]
     [string]$CapturePacketPacing = "off",
+    [int]$InputBufferSizeFrames = 0,
     [double]$MetricsIntervalSec = 1.0,
     [double]$DurationSec = 0,
     [string]$OutputFile = "",
@@ -47,6 +48,9 @@ if ($ListDevices) {
         if (-not $NoSenderSideAsrc) {
             $cargoArgs += "--sender-side-asrc"
         }
+    }
+    if ($InputBufferSizeFrames -gt 0) {
+        $cargoArgs += @("--input-buffer-size-frames", ([string]$InputBufferSizeFrames))
     }
     if ($DurationSec -gt 0) {
         $cargoArgs += @("--duration-sec", ([string]$DurationSec))

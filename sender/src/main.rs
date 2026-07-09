@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24};
+use cpal::{
+    BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24,
+};
 use lan_audio_common::audio::{f32_to_i16, rms_db, StereoFrame, CHANNELS, SAMPLE_RATE};
 use lan_audio_common::packet::{AudioPacketHeader, HEADER_SIZE, MAGIC};
 use lan_audio_common::resampler::StreamingLinearResampler;
@@ -19,6 +21,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 unsafe extern "system" {
     fn timeBeginPeriod(period_ms: u32) -> u32;
     fn timeEndPeriod(period_ms: u32) -> u32;
+}
+#[cfg(windows)]
+#[link(name = "avrt")]
+unsafe extern "system" {
+    fn AvSetMmThreadCharacteristicsW(
+        task_name: *const u16,
+        task_index: *mut u32,
+    ) -> *mut std::ffi::c_void;
+    fn AvSetMmThreadPriority(avrt_handle: *mut std::ffi::c_void, priority: i32) -> i32;
+    fn AvRevertMmThreadCharacteristics(avrt_handle: *mut std::ffi::c_void) -> i32;
+}
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetCurrentThread() -> *mut std::ffi::c_void;
+    fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
 }
 
 #[derive(Parser, Debug)]
@@ -59,6 +76,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value = "off")]
     capture_packet_pacing: CapturePacketPacing,
+
+    #[arg(long)]
+    input_buffer_size_frames: Option<u32>,
 
     #[arg(long)]
     duration_sec: Option<f64>,
@@ -133,6 +153,12 @@ const CAPTURE_PACING_MAX_CATCH_UP_PACKETS: usize = 4;
 const CAPTURE_UNPACED_MAX_BURST_PACKETS: usize = 16;
 const CAPTURE_PACING_SPIN_US: u64 = 200;
 const CAPTURE_POOL_SPARE_CHUNKS: usize = 2;
+#[cfg(windows)]
+const AVRT_PRIORITY_CRITICAL: i32 = 2;
+#[cfg(windows)]
+const THREAD_PRIORITY_HIGHEST: i32 = 2;
+#[cfg(windows)]
+const THREAD_PRIORITY_NORMAL: i32 = 0;
 
 struct TimerResolutionGuard {
     #[cfg(windows)]
@@ -176,11 +202,103 @@ impl Drop for TimerResolutionGuard {
     }
 }
 
+struct SenderThreadPriorityGuard {
+    #[cfg(windows)]
+    avrt_handle: Option<*mut std::ffi::c_void>,
+    #[cfg(windows)]
+    fallback_thread_priority_set: bool,
+}
+
+impl SenderThreadPriorityGuard {
+    fn boost_packet_dispatch_thread() -> Self {
+        #[cfg(windows)]
+        {
+            let mut task_index = 0u32;
+            let task_name: Vec<u16> = "Pro Audio".encode_utf16().chain(Some(0)).collect();
+            let avrt_handle =
+                unsafe { AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index) };
+            if !avrt_handle.is_null() {
+                let priority_set =
+                    unsafe { AvSetMmThreadPriority(avrt_handle, AVRT_PRIORITY_CRITICAL) };
+                if priority_set == 0 {
+                    eprintln!(
+                        "sender: failed to set MMCSS priority: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                println!(
+                    "sender: packet_dispatch_thread_priority=mmcss task=\"Pro Audio\" priority=critical"
+                );
+                return Self {
+                    avrt_handle: Some(avrt_handle),
+                    fallback_thread_priority_set: false,
+                };
+            }
+
+            eprintln!(
+                "sender: failed to enter MMCSS Pro Audio class: {}",
+                std::io::Error::last_os_error()
+            );
+            let fallback_set =
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) } != 0;
+            if fallback_set {
+                println!("sender: packet_dispatch_thread_priority=thread_priority_highest");
+            } else {
+                eprintln!(
+                    "sender: failed to set sender thread priority: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            Self {
+                avrt_handle: None,
+                fallback_thread_priority_set: fallback_set,
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for SenderThreadPriorityGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if let Some(avrt_handle) = self.avrt_handle.take() {
+                let reverted = unsafe { AvRevertMmThreadCharacteristics(avrt_handle) } != 0;
+                if !reverted {
+                    eprintln!(
+                        "sender: failed to leave MMCSS class: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            } else if self.fallback_thread_priority_set {
+                let restored =
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) } != 0;
+                if !restored {
+                    eprintln!(
+                        "sender: failed to restore sender thread priority: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 struct CaptureQueueSnapshot {
     dropped_chunks: u64,
     dropped_frames: u64,
     lock_misses: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+struct CaptureTimingSnapshot {
+    callback_gap_count: u64,
+    callback_gap_max: Duration,
 }
 
 struct CaptureQueueState {
@@ -193,11 +311,15 @@ struct CaptureQueue {
     mode: CaptureQueueMode,
     frame_capacity: usize,
     pool_capacity: usize,
+    created_at: Instant,
     state: Arc<Mutex<CaptureQueueState>>,
     ready: Condvar,
     dropped_chunks: AtomicU64,
     dropped_frames: AtomicU64,
     lock_misses: AtomicU64,
+    last_callback_ns: AtomicU64,
+    callback_gap_count: AtomicU64,
+    callback_gap_max_ns: AtomicU64,
 }
 
 impl CaptureQueue {
@@ -219,6 +341,7 @@ impl CaptureQueue {
             mode,
             frame_capacity,
             pool_capacity,
+            created_at: Instant::now(),
             state: Arc::new(Mutex::new(CaptureQueueState {
                 chunks: VecDeque::with_capacity(capacity),
                 free,
@@ -227,6 +350,9 @@ impl CaptureQueue {
             dropped_chunks: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             lock_misses: AtomicU64::new(0),
+            last_callback_ns: AtomicU64::new(0),
+            callback_gap_count: AtomicU64::new(0),
+            callback_gap_max_ns: AtomicU64::new(0),
         }
     }
 
@@ -235,6 +361,7 @@ impl CaptureQueue {
         T: Sample,
         f32: FromSample<T>,
     {
+        self.record_callback_timing(Instant::now());
         let channels = channels.max(1);
         let frames = data.len() / channels;
         if frames == 0 {
@@ -374,6 +501,27 @@ impl CaptureQueue {
         }
     }
 
+    fn take_timing_snapshot(&self) -> CaptureTimingSnapshot {
+        CaptureTimingSnapshot {
+            callback_gap_count: self.callback_gap_count.swap(0, Ordering::Relaxed),
+            callback_gap_max: Duration::from_nanos(
+                self.callback_gap_max_ns.swap(0, Ordering::Relaxed),
+            ),
+        }
+    }
+
+    fn record_callback_timing(&self, now: Instant) {
+        let now_ns = instant_offset_ns(self.created_at, now);
+        let previous_ns = self.last_callback_ns.swap(now_ns, Ordering::Relaxed);
+        if previous_ns == 0 || now_ns < previous_ns {
+            return;
+        }
+        let gap_ns = now_ns - previous_ns;
+        self.callback_gap_count.fetch_add(1, Ordering::Relaxed);
+        self.callback_gap_max_ns
+            .fetch_max(gap_ns, Ordering::Relaxed);
+    }
+
     fn record_dropped_chunk_len(&self, frames: usize) {
         self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
         self.dropped_frames
@@ -421,6 +569,9 @@ struct PacketSender {
     sequence: u32,
     sample_position: u64,
     start: Instant,
+    last_dispatch: Option<Instant>,
+    dispatch_gap_count: u64,
+    dispatch_gap_max: Duration,
     stats: SendStats,
     packet_bytes: Vec<u8>,
 }
@@ -437,6 +588,9 @@ impl PacketSender {
             sequence: 0,
             sample_position: 0,
             start: Instant::now(),
+            last_dispatch: None,
+            dispatch_gap_count: 0,
+            dispatch_gap_max: Duration::ZERO,
             stats: SendStats::default(),
             packet_bytes: Vec::with_capacity(HEADER_SIZE + 512),
         })
@@ -446,12 +600,14 @@ impl PacketSender {
         if frames.is_empty() {
             return Ok(());
         }
+        let dispatch_at = Instant::now();
+        self.record_packet_dispatch_timing(dispatch_at);
         let header = AudioPacketHeader::new(
             self.stream_id,
             self.sequence,
             frames.len() as u16,
             self.sample_position,
-            self.start.elapsed().as_nanos() as u64,
+            dispatch_at.duration_since(self.start).as_nanos() as u64,
         );
         write_packet_bytes(&mut self.packet_bytes, &header, frames);
         self.sequence = self.sequence.wrapping_add(1);
@@ -472,6 +628,32 @@ impl PacketSender {
             }
         }
     }
+
+    fn take_dispatch_timing(&mut self) -> PacketDispatchTimingSnapshot {
+        let snapshot = PacketDispatchTimingSnapshot {
+            gap_count: self.dispatch_gap_count,
+            gap_max: self.dispatch_gap_max,
+        };
+        self.dispatch_gap_count = 0;
+        self.dispatch_gap_max = Duration::ZERO;
+        snapshot
+    }
+
+    fn record_packet_dispatch_timing(&mut self, dispatch_at: Instant) {
+        if let Some(previous) = self.last_dispatch {
+            if let Some(gap) = dispatch_at.checked_duration_since(previous) {
+                self.dispatch_gap_count += 1;
+                self.dispatch_gap_max = self.dispatch_gap_max.max(gap);
+            }
+        }
+        self.last_dispatch = Some(dispatch_at);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct PacketDispatchTimingSnapshot {
+    gap_count: u64,
+    gap_max: Duration,
 }
 
 fn write_packet_bytes(out: &mut Vec<u8>, header: &AudioPacketHeader, frames: &[StereoFrame]) {
@@ -544,7 +726,7 @@ impl MetricsPrinter {
 
     fn maybe_print(
         &mut self,
-        sender: &PacketSender,
+        sender: &mut PacketSender,
         label: &str,
         rms: (f32, f32),
         buffer_ms: f32,
@@ -562,10 +744,12 @@ impl MetricsPrinter {
             .pacing_dropped_frames
             .saturating_sub(self.last_pacing_dropped_frames);
         let bitrate_mbps = bytes as f64 * 8.0 / elapsed / 1_000_000.0;
+        let capture_timing = self.capture_timing_snapshot();
+        let dispatch_timing = sender.take_dispatch_timing();
         let capture_suffix = self.capture_suffix(elapsed);
         let remote_suffix = self.remote_suffix();
         println!(
-            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB errors={} send_corr={:.1}ppm pacing_drop_frames={:.0}/s{}{}",
+            "sender: input={label} packets={:.1}/s bitrate={:.3}Mbps sequence={} sample_position={} capture_buffer={:.1}ms rms={:.1}/{:.1}dB errors={} send_corr={:.1}ppm pacing_drop_frames={:.0}/s capture_callback_gap_max={:.3}ms capture_callback_gaps={} packet_dispatch_gap_max={:.3}ms packet_dispatch_gaps={}{}{}",
             packets as f64 / elapsed,
             bitrate_mbps,
             sender.sequence,
@@ -576,6 +760,10 @@ impl MetricsPrinter {
             sender.stats.send_errors,
             send_rate_ppm,
             pacing_dropped_frames as f64 / elapsed,
+            duration_ms(capture_timing.callback_gap_max),
+            capture_timing.callback_gap_count,
+            duration_ms(dispatch_timing.gap_max),
+            dispatch_timing.gap_count,
             capture_suffix,
             remote_suffix
         );
@@ -584,6 +772,13 @@ impl MetricsPrinter {
         self.last_packets = sender.stats.sent_packets;
         self.last_bytes = sender.stats.sent_bytes;
         self.last_pacing_dropped_frames = sender.stats.pacing_dropped_frames;
+    }
+
+    fn capture_timing_snapshot(&self) -> CaptureTimingSnapshot {
+        self.capture_queue
+            .as_ref()
+            .map(|capture_queue| capture_queue.take_timing_snapshot())
+            .unwrap_or_default()
     }
 
     fn capture_suffix(&mut self, elapsed: f64) -> String {
@@ -664,6 +859,9 @@ fn validate_audio_args(args: &Args) -> Result<()> {
     if args.capture_queue_capacity == 0 {
         bail!("--capture-queue-capacity must be greater than zero");
     }
+    if args.input_buffer_size_frames == Some(0) {
+        bail!("--input-buffer-size-frames must be greater than zero");
+    }
     if args.sender_asrc_kp < 0.0 || args.sender_asrc_max_ppm < 0.0 {
         bail!("--sender-asrc-kp and --sender-asrc-max-ppm must be zero or greater");
     }
@@ -735,6 +933,7 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
     let packet_frames = packet_frames(args)?;
     let (stream, capture_queue, source_rate) =
         open_capture_stream(args, args.capture_queue_capacity)?;
+    let _thread_priority = SenderThreadPriorityGuard::boost_packet_dispatch_thread();
     stream.play().context("failed to start input stream")?;
 
     println!(
@@ -801,7 +1000,13 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
 
             if sent_packets > 0 {
                 let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-                metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+                metrics.maybe_print(
+                    &mut sender,
+                    "capture",
+                    latest_rms,
+                    pending_ms,
+                    send_rate_ppm,
+                );
                 continue;
             }
 
@@ -822,7 +1027,13 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
 
             if sent_packets > 0 {
                 let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-                metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+                metrics.maybe_print(
+                    &mut sender,
+                    "capture",
+                    latest_rms,
+                    pending_ms,
+                    send_rate_ppm,
+                );
                 continue;
             }
         }
@@ -847,7 +1058,13 @@ fn run_capture_sender(args: &Args, remote_status: Option<SharedReceiverStatus>) 
             }
         }
         let pending_ms = pending.len() as f32 * 1000.0 / args.sample_rate as f32;
-        metrics.maybe_print(&sender, "capture", latest_rms, pending_ms, send_rate_ppm);
+        metrics.maybe_print(
+            &mut sender,
+            "capture",
+            latest_rms,
+            pending_ms,
+            send_rate_ppm,
+        );
     }
 }
 
@@ -862,7 +1079,10 @@ fn open_capture_stream(
         .default_input_config()
         .context("failed to get default input config")?;
     let sample_format = supported.sample_format();
-    let config = supported.config();
+    let mut config = supported.config();
+    if let Some(frames) = args.input_buffer_size_frames {
+        config.buffer_size = BufferSize::Fixed(frames);
+    }
     let source_rate = config.sample_rate;
     let source_channels = config.channels as usize;
     let capture_frame_capacity = capture_frame_capacity_for_stream(&config);
@@ -873,13 +1093,15 @@ fn open_capture_stream(
     ));
 
     println!(
-        "selected_device=\"{}\" input_format={}Hz/{}ch/{:?} capture_pool_chunks={} capture_pool_frames={}",
+        "selected_device=\"{}\" input_format={}Hz/{}ch/{:?} input_buffer={:?} capture_pool_chunks={} capture_pool_frames={} {}",
         device_name,
         source_rate,
         source_channels,
         sample_format,
+        config.buffer_size,
         queue_capacity.saturating_add(CAPTURE_POOL_SPARE_CHUNKS),
-        capture_frame_capacity
+        capture_frame_capacity,
+        cpal_capture_backend_note()
     );
 
     let stream = build_input_stream(
@@ -963,10 +1185,22 @@ where
 
 fn capture_frame_capacity_for_stream(config: &StreamConfig) -> usize {
     match config.buffer_size {
-        cpal::BufferSize::Fixed(frames) => usize::try_from(frames).unwrap_or(usize::MAX),
-        cpal::BufferSize::Default => {
+        BufferSize::Fixed(frames) => usize::try_from(frames).unwrap_or(usize::MAX).max(2048),
+        BufferSize::Default => {
             (usize::try_from(config.sample_rate).unwrap_or(48_000) / 2).max(2048)
         }
+    }
+}
+
+fn cpal_capture_backend_note() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cpal_wasapi_mode=shared_event cpal_wasapi_exclusive=false"
+    }
+
+    #[cfg(not(windows))]
+    {
+        "cpal_capture_mode=host_default"
     }
 }
 
@@ -994,10 +1228,11 @@ fn list_input_devices() -> Result<()> {
             .default_input_config()
             .map(|config| {
                 format!(
-                    "{}Hz/{}ch/{:?}",
+                    "{}Hz/{}ch/{:?} buffer={:?}",
                     config.sample_rate(),
                     config.channels(),
-                    config.sample_format()
+                    config.sample_format(),
+                    config.buffer_size()
                 )
             })
             .unwrap_or_else(|err| format!("no default config: {err}"));
@@ -1010,6 +1245,15 @@ fn packet_interval(args: &Args, send_rate_ppm: f64) -> Duration {
     let nominal = args.packet_ms / 1000.0;
     let speed = 1.0 + (args.drift_ppm + send_rate_ppm) / 1_000_000.0;
     Duration::from_secs_f64(nominal / speed.max(0.0001))
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn instant_offset_ns(start: Instant, now: Instant) -> u64 {
+    let elapsed = now.saturating_duration_since(start).as_nanos();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
 }
 
 fn wait_until_packet_deadline(deadline: Instant) {
