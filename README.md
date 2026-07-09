@@ -2,420 +2,204 @@
 
 `my-lan-audio` は、PC の音声を LAN/UDP で別マシンへ送るための実験用 audio bridge です。
 
-主な想定は Windows の `VB-CABLE Output` を sender で capture し、macOS の receiver で受けて BlackHole や物理スピーカーへ出す構成です。現在は macOS 1台だけでも、`BlackHole -> sender -> receiver -> MacBook のスピーカー` のように信号を流して検証できます。
+現在の主な実用構成は以下です。
+
+```text
+Windows VB-CABLE Output
+  -> Windows sender
+  -> UDP over LAN
+  -> macOS receiver
+  -> BlackHole 2ch または macOS の物理出力
+```
+
+Dante / AES67 のような汎用 audio network 互換を目指すのではなく、手元の LAN で使えること、ログで状態を読めること、設定を少数に保つことを優先しています。現時点の安定運用目標は `30ms` receiver buffer + Windows sender feedback です。
 
 ## 現在の状態
 
-2026-07-07 時点の実装は macOS-first で安定性改善まで入っています。
-2026-07-08 に Windows/MSVC host での build check、WASAPI デバイス一覧確認、Windows 向け PowerShell launcher、CPAL の PCM/float sample format 対応拡張を追加しました。同日に localhost 低レイテンシー検証用として、receiver の direct audio path と packet arrival clock sync も追加しています。
+現在の実運用パスは次の通りです。
 
-実装済み:
+- `sender`: live capture 専用
+- `receiver`: direct CPAL/CoreAudio output
+- packet format: 48kHz stereo, 16-bit PCM over UDP
+- sender 側で capture device rate から 48kHz へ resampling
+- receiver 側で output device rate へ resampling
+- Windows sender の packet dispatch thread は MMCSS / high priority 化済み
+- capture callback 内 allocation を避けるため、capture queue chunk を preallocate
+- receiver -> sender feedback UDP により sender-side ASRC が送出レートを微調整
+- receiver log に buffer percentile、arrival gap、sender send gap を出力
+- sender log に capture callback gap、packet dispatch gap を出力
 
-- Rust workspace: `common`, `sender`, `receiver`
-- UDP packet format: 48 kHz / stereo / signed 16-bit little-endian PCM
-- sender input: `dummy`, `sine`, WAV file, live capture
-- sender-side capture resampling: input device が 44.1 kHz でも 48 kHz packet に変換
-- receiver output: `null`, WAV file, CPAL audio output (CoreAudio / WASAPI)
-- receiver-side output resampling: output device が 44.1 kHz / 48 kHz どちらでも出力
-- jitter buffer, loss / late / duplicate / out-of-order metrics
-- fixed-buffer playout scheduler: `--fixed-delay-frames <FRAMES>` は receiver 内部の `jitter + output ring` 合算予算。`--fixed-latency-ms <MS>` は人間向け alias
-- receiver -> sender feedback status UDP
-- receiver の既定 `ring` path では audio callback は SPSC ring 読み取り専用
-- `JitterBuffer` は renderer / timed output 側が単独所有し、audio callback や UDP receive thread と `Mutex<JitterBuffer>` を共有しない
-- receiver の UDP thread -> renderer queue は満杯時に古いeventを捨て、新しいpacketを残す
-- renderer は output ring 水位と UDP event 到着で起床し、固定sleepによる余分な待ちを抑える
-- receiver audio output は既定の `ring` path に加えて、callback が `JitterBuffer` から直接 pull する `direct` path を選べる
-- receiver `--clock-sync packet` は packet arrival 時刻を基準に、receiver 側 playout 位置を前方へ追いつかせる
-- sender live capture は処理遅れ時に古いcapture chunkを捨て、最新chunkへ追いつく
-- output ring の既定値は `40ms`
-- queue drop / ring underrun / steady underrun などの安定性 metrics
+VNC で Windows に接続したまま多少雑に操作しても、現在の `30ms` 構成では実用的に安定しています。より低い buffer も動きますが、OS scheduling の揺れを直接受けるため余裕は薄くなります。
 
-未採用の大きな設計案:
+実用レンジの目安:
 
-- receiver clock master の pull model
-- PTP などによる sender / receiver 間の明示的な絶対時刻 network clock sync
-- Dante / AES67 / RTP / PTP 互換
-- 暗号化、認証、複数送信元、マルチキャスト
-
-Windows capture / playback のコードと helper script はありますが、Windows -> macOS の長時間実機検証は別途必要です。
+```text
+1440 frames / 30ms   安定運用目標
+720 frames / 15ms    攻めた設定
+480 frames / 10ms    かなり攻めた設定
+360 frames / 7.5ms   実験用
+```
 
 ## 構成
 
 ```text
 .
-├── Cargo.toml
-├── mise.toml
-├── PLAN.md
-├── UPDATE.md
-├── README.md
-├── common/
-│   └── src/
-│       ├── audio.rs
-│       ├── jitter.rs
-│       ├── packet.rs
-│       ├── resampler.rs
-│       └── status.rs
-├── sender/
-│   └── src/main.rs
-└── receiver/
-    ├── src/audio_ring.rs
-    └── src/main.rs
+├── common/              packet, audio, resampler, jitter, status 共通実装
+├── receiver/            UDP receiver と audio output
+├── sender/              capture sender
+├── scripts/
+│   ├── windows-sender.bat
+│   ├── windows-sender.ps1
+│   └── windows-receiver.ps1
+├── Makefile             macOS 側の起動 shortcut
+├── TODO.md              latency work の残り
+└── README.md
 ```
-
-実行時の大まかな流れ:
-
-```text
-capture / sine / wav
-  -> sender
-  -> UDP audio packets
-  -> receiver UDP thread
-  -> bounded packet event queue
-  -> renderer-owned JitterBuffer
-  -> SPSC output ring
-  -> CPAL audio callback
-  -> output device
-```
-
-低レイテンシー検証用の `--audio-path direct` では、renderer thread と SPSC output ring を通さず、CPAL audio callback が `JitterBuffer` を直接所有して pull します。これは receiver 側の実装切り替えなので、Windows sender の capture / UDP packet 送信実装はそのまま使います。
 
 ## 必要なもの
 
-共通:
+macOS receiver:
 
 - `mise`
-- Rust `1.95.0`。`mise.toml` で指定済み
+- `mise.toml` で指定された Rust
+- `BlackHole 2ch`、MacBook speakers、headphones などの出力先
 
-macOS で仮想音声ループを試す場合:
+Windows sender:
 
-- BlackHole などの仮想オーディオデバイス
-- 出力先として使う物理デバイス。例: `MacBook Proのスピーカー`, Bluetooth headphones
-
-Windows で実音声を送る場合:
-
+- PowerShell から Rust build できる環境
 - VB-Audio Virtual Cable
-- Windows 側で Rust build できる環境
+- `CABLE Output` のような capture input device
 - PowerShell 5 以降
-- 入力デバイスとして `CABLE Output` が見える状態
 
-## セットアップ
+## セットアップとビルド
+
+macOS:
 
 ```bash
 mise install
 mise exec -- rustc -Vv
-mise exec -- cargo --version
-```
-
-Apple Silicon Mac では `rustc -Vv` の `host` が `aarch64-apple-darwin` になっていることを確認してください。
-
-## ビルド
-
-開発ビルド:
-
-```bash
-mise exec -- cargo build
-```
-
-release ビルド:
-
-```bash
 mise exec -- cargo build --release
 ```
 
-生成される主なバイナリ:
+Windows では、repository root または `scripts/` から launcher を使います。内部では `mise exec -- cargo run --release -p sender -- ...` を呼びます。
+
+```bat
+scripts\windows-sender.bat
+```
+
+## 現在の安定起動
+
+まず Windows sender を起動します。`scripts\windows-sender.bat` の既定値は、現在の `30ms` receiver 運用に寄せています。
 
 ```text
-target/debug/sender
-target/debug/receiver
-target/release/sender
-target/release/receiver
-target/debug/sender.exe       # Windows
-target/debug/receiver.exe     # Windows
-target/release/sender.exe     # Windows
-target/release/receiver.exe   # Windows
+target:                  192.168.11.65:50000
+feedback listen:         0.0.0.0:50001
+capture device:          CABLE Output
+packet ms:               10
+capture queue capacity:  16
+capture queue mode:      fifo
+capture packet pacing:   on
+input buffer frames:     256
 ```
 
-## テスト
+同じ設定は環境変数で上書きできます。
 
-```bash
-mise exec -- cargo fmt --all -- --check
-mise exec -- cargo clippy --all-targets -- -D warnings
-mise exec -- cargo test
+```bat
+set LAN_AUDIO_TARGET=192.168.11.65:50000
+set LAN_AUDIO_FEEDBACK_LISTEN=0.0.0.0:50001
+set LAN_AUDIO_DEVICE=CABLE Output
+set LAN_AUDIO_PACKET_MS=10
+set LAN_AUDIO_CAPTURE_QUEUE_CAPACITY=16
+set LAN_AUDIO_CAPTURE_QUEUE_MODE=fifo
+set LAN_AUDIO_CAPTURE_PACKET_PACING=on
+set LAN_AUDIO_INPUT_BUFFER_SIZE_FRAMES=256
+scripts\windows-sender.bat
 ```
 
-CLI option の確認:
-
-```bash
-mise exec -- cargo run -p sender -- --help
-mise exec -- cargo run -p receiver -- --help
-```
-
-## まず動かす: WAV loopback
-
-macOS 1台で UDP 経路と jitter buffer を確認します。receiver を先に起動してください。
-
-Terminal 1:
-
-```bash
-mise exec -- cargo run -p receiver -- \
-  --listen 127.0.0.1:50000 \
-  --output wav \
-  --output-file /tmp/my-lan-audio-loopback.wav \
-  --fixed-delay-frames 14400 \
-  --duration-sec 5
-```
-
-Terminal 2:
-
-```bash
-mise exec -- cargo run -p sender -- \
-  --target 127.0.0.1:50000 \
-  --input sine \
-  --duration-sec 3
-```
-
-期待値:
-
-- sender が約 `200 packets/s` で送る
-- bitrate が約 `1.6 Mbps`
-- receiver が `state=Running` になる
-- `loss`, `late`, `dup`, `ooo`, `qdrop` が 0
-- `/tmp/my-lan-audio-loopback.wav` が生成される
-
-## まず動かす: receiver 単体の音出し
-
-UDP を使わず、receiver が output device を開けるか確認します。
-
-出力デバイス一覧:
-
-```bash
-mise exec -- cargo run -p receiver -- --list-devices
-```
-
-test tone:
-
-```bash
-mise exec -- cargo run -p receiver -- \
-  --test-tone \
-  --output audio \
-  --output-device "MacBook Proのスピーカー" \
-  --duration-sec 5
-```
-
-`--output-device` は部分一致です。表示名に合わせて `"SOUNDPEATS"`, `"BlackHole"`, `"MacBook"` など短めに指定できます。
-
-## macOS 1台で BlackHole -> sender -> receiver -> スピーカー
-
-システム音声や YouTube Music を BlackHole に出し、それを sender で capture して、receiver から物理スピーカーへ戻す確認手順です。
-
-1. macOS のシステムサウンド出力を `BlackHole 2ch` にする
-2. sender 側で BlackHole が入力デバイスとして見えることを確認する
-3. receiver 側で MacBook のスピーカーなど物理出力が見えることを確認する
-4. receiver を起動する
-5. sender を起動する
-6. YouTube Music などを再生する
-
-入力デバイス一覧:
-
-```bash
-mise exec -- cargo run -p sender -- --list-devices
-```
-
-出力デバイス一覧:
-
-```bash
-mise exec -- cargo run -p receiver -- --list-devices
-```
-
-Terminal 1: receiver
-
-```bash
-mise exec -- cargo run -p receiver -- \
-  --listen 127.0.0.1:50000 \
-  --feedback-target 127.0.0.1:50001 \
-  --fixed-delay-frames 14400 \
-  --output audio \
-  --output-device "MacBook Proのスピーカー" \
-  --output-ring-ms 60 \
-  --output-ring-capacity-ms 160 \
-  --render-chunk-ms 2
-```
-
-Terminal 2: sender
-
-```bash
-mise exec -- cargo run -p sender -- \
-  --target 127.0.0.1:50000 \
-  --feedback-listen 127.0.0.1:50001 \
-  --input capture \
-  --device "BlackHole 2ch"
-```
-
-確認ポイント:
-
-- sender の `rms=.../...dB` が再生音に応じて動く
-- sender の `remote_buf`, `remote_outq`, `remote_total`, `remote_qdrop` が表示される
-- receiver の `packets` と `queued` が約 `200/s`
-- receiver の `qdrop=0.0/s`, `steady_under=0`, `ring_under=0.0/s`
-- receiver の `total_buf` が固定値付近に留まる
-
-注意:
-
-- receiver の出力先に BlackHole を選ぶと、スピーカーからは聞こえません。聞く場合は `MacBook Proのスピーカー` や headphones を選んでください。
-- システム出力を BlackHole にすると、通常のスピーカーからは直接音が出なくなります。このアプリの receiver がスピーカーへ戻す役割になります。
-- feedback port は audio port と別です。上の例では audio が `50000`, feedback が `50001` です。
-
-### 固定バッファ Makefile shortcut
-
-localhost で固定バッファ設定を試す場合は、receiver を先に起動してから sender を起動します。Makefile の既定値は `FIXED_DELAY_FRAMES=14400`、つまり 48kHz 基準で `300ms` です。
-
-Terminal 1:
-
-```bash
-make receiver
-```
-
-Terminal 2:
-
-```bash
-make sender
-```
-
-`make receive` も `make receiver` の alias です。
-
-既定値は以下です。
-
-```text
-receiver output device: system default
-sender input device: BlackHole 2ch
-receiver listen: 0.0.0.0:50000
-sender target: 127.0.0.1:50000
-sender feedback listen: 0.0.0.0:50001
-fixed-delay-frames: 14400
-fixed-latency-ms alias: 300
-packet-ms: 5
-sender-side ASRC: enabled
-```
-
-デバイス名や固定遅延は make 変数で上書きできます。
-
-```bash
-make receiver RECEIVER_OUTPUT_DEVICE="BlackHole 2ch"
-make receiver FIXED_DELAY_FRAMES=9600
-make receiver FIXED_DELAY_FRAMES= FIXED_LATENCY_MS=300
-make sender SENDER_INPUT_DEVICE="BlackHole" PACKET_MS=5
-```
-
-direct path + packet clock sync で 1 frame まで詰める場合は、release build の低遅延 shortcut を使います。
-
-Terminal 1:
+次に macOS receiver を起動します。
 
 ```bash
 make d-receiver
 ```
 
-Terminal 2:
+`make d-receiver` は現在、release receiver を次の設定で起動します。
+
+```text
+--listen 0.0.0.0:50000
+--feedback-target 192.168.11.96:50001
+--output-device "BlackHole 2ch"
+--fixed-delay-frames 1440
+--clock-sync on
+--output-sample-rate 48000
+--output-buffer-size-frames 32
+```
+
+Windows sender の LAN IP が違う場合は、feedback host だけ指定します。
 
 ```bash
+make d-receiver SENDER_FEEDBACK_HOST=<Windows sender LAN IP>
+```
+
+または feedback target 全体を指定します。
+
+```bash
+make d-receiver RECEIVER_FEEDBACK_TARGET=<Windows sender LAN IP>:50001
+```
+
+feedback を一時的に無効にする場合:
+
+```bash
+make d-receiver RECEIVER_FEEDBACK_TARGET=
+```
+
+`d-receiver` と `d-sender` は `logs/` に timestamp 付き log を出します。`logs/` は git 管理外です。
+
+## Makefile targets
+
+```bash
+make d-receiver
 make d-sender
 ```
 
-`d-receiver` の既定値は `DIRECT_FIXED_DELAY_FRAMES`, `DIRECT_OUTPUT_SAMPLE_RATE`, `DIRECT_OUTPUT_BUFFER_SIZE_FRAMES`, `DIRECT_CLOCK_SYNC` で調整できます。`DIRECT_CLOCK_SYNC=on` は packet arrival clock sync を有効にします。`packet` も同じ意味で、`off` は無効です。`d-sender` は `DIRECT_PACKET_MS`, `DIRECT_CAPTURE_QUEUE_CAPACITY`, `DIRECT_CAPTURE_QUEUE_MODE`, `DIRECT_CAPTURE_PACKET_PACING` で送信packet幅、capture queue容量、読み取り方式、packet pacingを調整します。既定の `DIRECT_CAPTURE_QUEUE_MODE=fifo` はcapture済みchunkを古い順に送り、`latest` は低遅延維持のために古いchunkを捨てます。`DIRECT_CAPTURE_PACKET_PACING=on` はcapture chunkを一気送信せず、`DIRECT_PACKET_MS` の間隔で1packetずつ送ります。どちらも起動時に `logs/d-receiver-YYYYmmdd-HHMMSS.log` / `logs/d-sender-YYYYmmdd-HHMMSS.log` へ build と実行ログを残します。`logs/` は git 管理外です。
+よく使う override:
 
-## Windows で動かす
+```text
+SENDER_FEEDBACK_HOST=<Windows sender LAN IP>
+RECEIVER_FEEDBACK_TARGET=<Windows sender LAN IP>:50001
+RECEIVER_OUTPUT_DEVICE="BlackHole 2ch"
+DIRECT_FIXED_DELAY_FRAMES=1440
+DIRECT_OUTPUT_SAMPLE_RATE=48000
+DIRECT_OUTPUT_BUFFER_SIZE_FRAMES=32
+DIRECT_CLOCK_SYNC=on
+LOG_DIR=logs
+```
 
-PowerShell の実行ポリシーで `.ps1` を直接実行できない場合は、以下のように `-ExecutionPolicy Bypass` 付きで起動してください。以降の例はプロジェクトルートから実行します。
+`make d-sender` は主に macOS / local test 用です。実用中の Windows sender profile は `scripts/windows-sender.bat` 側にあります。
 
-sender input device 一覧:
+## Windows sender script
+
+入力デバイス一覧:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-sender.ps1 -ListDevices
 ```
 
-receiver output device 一覧:
+明示的に起動する場合:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-receiver.ps1 -ListDevices
-```
-
-Windows 1台で UDP 経路だけ確認する場合:
-
-Terminal 1:
-
-```powershell
-.\scripts\windows-receiver.ps1 `
-  -Listen 127.0.0.1:50000 `
-  -Output wav `
-  -OutputFile .\target\windows-loopback.wav `
-  -LatencyMode normal `
-  -TargetBufferMs 80 `
-  -StartThresholdMs 80 `
-  -DurationSec 5
-```
-
-Terminal 2:
-
-```powershell
-mise exec -- cargo run -p sender -- `
-  --target 127.0.0.1:50000 `
-  --input sine `
-  --duration-sec 3
-```
-
-Windows の VB-CABLE を capture して Windows のスピーカーへ戻す場合:
-
-Terminal 1:
-
-```powershell
-.\scripts\windows-receiver.ps1 `
-  -Listen 127.0.0.1:50000 `
-  -FeedbackTarget 127.0.0.1:50001 `
-  -Output audio `
-  -OutputDevice "スピーカー"
-```
-
-Terminal 2:
-
-```powershell
-.\scripts\windows-sender.ps1 `
-  -Target 127.0.0.1:50000 `
-  -FeedbackListen 127.0.0.1:50001 `
-  -Device "CABLE Output"
-```
-
-release build で起動する場合は各 script に `-Release` を付けます。`-OutputDevice` / `-Device` は部分一致なので、デバイス一覧に出た名前の一部で指定できます。
-
-## Windows -> macOS
-
-macOS 側 receiver:
-
-```bash
-make mac-ip
-make p-receiver RECEIVER_OUTPUT_DEVICE="BlackHole 2ch"
-```
-
-Windows 側 sender:
-
-```powershell
-.\scripts\windows-sender.ps1 `
-  -Target <make mac-ipで出たmacOSのLAN IP>:50000 `
-  -Device "CABLE Output"
-```
-
-sender 側で receiver feedback も見る場合:
-
-```bash
-make p-receiver \
-  RECEIVER_OUTPUT_DEVICE="BlackHole 2ch" \
-  RECEIVER_FEEDBACK_TARGET=<WindowsのLAN IP>:50001
-```
-
-```powershell
-.\scripts\windows-sender.ps1 `
-  -Target <macOSのLAN IP>:50000 `
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-sender.ps1 `
+  -Target 192.168.11.65:50000 `
   -FeedbackListen 0.0.0.0:50001 `
-  -Device "CABLE Output"
+  -Device "CABLE Output" `
+  -PacketMs 10 `
+  -CaptureQueueCapacity 16 `
+  -CaptureQueueMode fifo `
+  -CapturePacketPacing on `
+  -InputBufferSizeFrames 256 `
+  -Release
 ```
 
+<<<<<<< HEAD
 ## Windows w-sender
 
 `w-sender` は Windows / VB-CABLE 向けの低遅延実験用 sender です。VB-CABLE / WASAPI capture event で届いた chunk を、その場で最大 `--max-packet-frames` ごとに UDP packet へ分割して送ります。sender 側では packet pacing timer、capture queue、sender-side ASRC を使いません。
@@ -612,233 +396,184 @@ mise exec -- cargo run -p receiver -- \
 --duration-sec <SEC>                    指定秒数で終了
 --metrics-interval-sec <SEC>            metrics表示間隔
 ```
+=======
+`-FeedbackListen` を指定すると、`-NoSenderSideAsrc` を付けない限り sender-side ASRC が有効になります。
+>>>>>>> cd11d57226ce332c0b3802b0f338e1152a376e64
 
 ## metrics の読み方
 
-sender:
+### receiver
+
+主な receiver fields:
 
 ```text
-sender: input=capture packets=200.0/s bitrate=1.619Mbps sequence=...
-        capture_buffer=...ms rms=-20.8/-20.8dB dropped=0 errors=0
-        capture_qdrop=0.0/s capture_qdrop_frames=0/s capture_lock_miss=0.0/s
-        remote_buf=...fr/...ms remote_outq=...fr/...ms remote_total=...fr/...ms remote_qdrop=0 ...
+packets / queued          packet 受信 rate と queue accepted rate
+loss / late / dup / ooo   network / sequence 異常
+qdrop / qinvalid          receiver queue drop または invalid packet
+buf                       現在の jitter buffer 深さ
+fixed                     設定された fixed receiver delay
+buf_min / p05 / p50 / p95 直近 window の buffer 深さ
+arrival_gap_max           receiver 側で見た最大 packet 到着間隔
+send_gap_max              sender timestamp 上の最大送信間隔
+steady_under              steady-state underrun
+missing_calls             output call 内で音声 frame が欠けた回数
+resyncs                   stream change / underrun resync count
+scratch_overflow          output scratch buffer overflow
 ```
 
-見るところ:
-
-- `packets`: 5ms packet なら約 `200/s`、2.5ms packet なら約 `400/s`
-- `bitrate`: 48kHz / stereo / 16-bit なら約 `1.6Mbps`
-- `rms`: capture 音量。無音なら `-120dB` 付近
-- `dropped`, `errors`: sender 側送信異常
-- `capture_qdrop`: sender live capture queue で低遅延維持のために捨てた古いchunk
-- `capture_qdrop_frames`: 捨てたcapture frame数
-- `capture_lock_miss`: capture callback が queue lock を取れず chunk を捨てた回数
-- `capture_callback_gap_max`: capture callback 間隔の区間内最大値
-- `packet_dispatch_gap_max`: sender が UDP packet を dispatch した間隔の区間内最大値
-- `remote_buf`: receiver の jitter buffer 水位
-- `remote_outq`: receiver の output ring 水位
-- `remote_total`: receiver 内部の合算 buffer 水位
-- `remote_qdrop`: receiver の UDP thread -> renderer queue drop
-- `remote_steady_under`, `remote_ring_under`: 通常運転中の underrun
-- `send_corr`: sender-side ASRC の補正量
-- `remote_ratio`: receiver の実効 resampling ratio
-
-receiver:
+`30ms` profile で安定している目安:
 
 ```text
-receiver: state=Running packets=200.0/s queued=200.0/s qdrop=0.0/s qinvalid=0.0/s
-          loss=0.0/s late=0.0/s dup=0.0/s ooo=0.0/s
-          buf=12480fr/260.0ms fixed=14400fr/300.0ms outq=1920fr/40.0ms total_buf=14400fr/300.0ms
-          ratio=0.999970 drift=...ppm startup_under=... steady_under=0
-          lock_miss=0.0/s ring_under=0.0/s ring_missing=0/s ring_overflow=0/s
+steady_under=0
+missing_calls=0.0/s
+missing_frames=0/s
+loss=0.0/s
+qdrop=0.0/s
+resyncs が増え続けない
+buf_min が通常は数ms以上残る
 ```
 
-安定している目安:
+`startup_under` は receiver 起動直後、sender restart、priming 中に増えることがあります。通常運転の評価では `steady_under`、`missing_calls`、`resyncs` を重視します。
 
-- `packets` と `queued` が約 `200/s`
-- `qdrop=0.0/s`。非ゼロなら receiver queue が古いeventを捨てて最新packetを優先している
-- `loss=0.0/s`, `late=0.0/s`, `dup=0.0/s`, `ooo=0.0/s`
-- `steady_under=0`
-- `ring_under=0.0/s`
-- `lock_miss=0.0/s`
-- `total_buf` が固定 delay 付近
-- `outq` が `--output-ring-ms` 付近
+### sender
 
-`startup_under` は receiver 起動直後や sender 開始前の priming 中に増えることがあります。通常運転の評価では `steady_under`, `ring_under`, `qdrop` を重視してください。
-
-## latency について
-
-ログ上の主な buffer / latency は以下です。
+主な sender fields:
 
 ```text
-buf / remote_buf: receiver jitter buffer 内の音声水位
-outq / remote_outq: audio callback手前のSPSC output ring水位
-total_buf / remote_total: buf + outqを48kHz source frame換算で合算した値
-fixed / remote_fixed: 設定された固定delay frames
+packets                    packet 送信 rate
+capture_buffer             未送信 capture backlog
+errors                     UDP send errors
+send_corr                  receiver feedback による sender-side ASRC 補正
+pacing_drop_frames         packet pacing が捨てた frames
+capture_callback_gap_max   capture callback 間隔の区間内最大値
+packet_dispatch_gap_max    UDP packet dispatch 間隔の区間内最大値
+capture_qdrop              capture queue drops
+capture_lock_miss          capture callback が queue lock を取れなかった回数
+remote_status              最新 receiver feedback、または waiting
 ```
 
-実際に耳で感じる遅延は、おおむね以下の合計です。
+`packet-ms=10` では `packets` は約 `100/s` です。`packet_dispatch_gap_max` が 10ms 前後なのは packet size 的に自然です。現在の Windows / VB-CABLE 経路では `capture_callback_gap_max` が 10-20ms になることがあり、これを吸収するために receiver 側 `30ms` を安定目標にしています。
 
-```text
-jitter buffer latency
-+ output ring latency
-+ audio backend / device / Bluetooth 側の遅延
-+ capture device 側の遅延
-```
+`remote_status=waiting` は sender が receiver feedback を受け取れていない状態です。次を確認します。
 
-receiver は固定バッファ playout のみです。既定値は `--fixed-delay-frames 14400` で、48kHz 基準の 300ms です。この値は receiver 内部の `jitter buffer + output ring` の合算予算として扱われます。renderer は output ring に積まれた分を jitter 側の必要水位から差し引きます。
+- Windows sender が `0.0.0.0:50001` で feedback listen している
+- macOS receiver が `--feedback-target <Windows IP>:50001` 付きで起動している
+- firewall が UDP feedback を止めていない
 
-```text
-fixed / remote_fixed = 14400fr
-outq / remote_outq = audio callback手前のoutput ring水位
-total_buf / remote_total ~= fixed
-```
+## 安定性の判断
 
-`--fixed-delay-frames 14400` かつ `--output-ring-ms 40` の場合、output ring が約 `1920fr` なら jitter buffer は約 `12480fr` を目標にします。receiver 内部の buffered latency は合算でおおむね `14400fr` です。実際に耳やDAWで観測される遅延には、そこへ backend/device/capture 側の固定遅延が加わります。DAW 側で固定補正する場合は、クリックやパルスで実測して補正値を決めてください。
+receiver は fixed delay が実際の arrival / send gap より大きい間は、sender や capture の塊化を吸収できます。現在の安定設定では:
 
-audio output では `--output-ring-ms` が固定delay内に収まる必要があります。例えば `--fixed-latency-ms 20` を指定する場合、`--output-ring-ms` は 20ms 未満にしてください。
+- `packet-ms=10` で 1ms packet の scheduling pressure を避ける
+- Windows capture callback は 10-20ms 単位で来ることがある
+- `fixed-delay-frames=1440` で receiver 側に 30ms の余白を作る
+- feedback により sender-side ASRC が長期 drift を補正する
 
-`--audio-path direct` は renderer thread と output ring を通さず、CPAL/CoreAudio callback が `JitterBuffer` から直接 pull します。localhost の低レイテンシー測定では、例えば以下の条件で callback 前 ring の待ちを外せます。
+receiver metrics が clean なのに音がぶちぶちする場合は、receiver buffer underrun ではなく、capture source や output monitoring path を疑います。
+
+よくある原因:
+
+- Windows sender 側の VNC / screen capture load
+- VB-CABLE に入ってくる音自体の glitch
+- macOS 側で BlackHole を monitor しているアプリの glitch
+- feedback 未接続による長期 drift
+
+## 低 latency 実験
+
+receiver frame 数は次のように上書きできます。
 
 ```bash
-./target/release/receiver \
-  --listen 127.0.0.1:50000 \
-  --output audio \
-  --output-device "BlackHole" \
-  --audio-path direct \
-  --output-sample-rate 48000 \
-  --output-buffer-size-frames 64 \
-  --fixed-latency-ms 1
+make d-receiver DIRECT_FIXED_DELAY_FRAMES=720
+make d-receiver DIRECT_FIXED_DELAY_FRAMES=480
+make d-receiver DIRECT_FIXED_DELAY_FRAMES=360
 ```
 
-さらに `--clock-sync on` または `--clock-sync packet` を使うと、最初に受け取った packet の sample position と receiver 到着時刻を anchor にして、callback 実行時刻から playout 位置を計算します。これは PTP / NTP のようなホスト間の絶対時刻同期ではなく、receiver 内部で packet arrival clock に追従する仕組みです。
-
-```bash
-./target/release/receiver \
-  --listen 127.0.0.1:50000 \
-  --output audio \
-  --output-device "BlackHole" \
-  --audio-path direct \
-  --clock-sync packet \
-  --output-sample-rate 48000 \
-  --output-buffer-size-frames 64 \
-  --fixed-delay-frames 1
-```
-
-2026-07-08 の localhost 測定では、`sender --input sine --target 127.0.0.1:50000 --packet-ms 1.0` と組み合わせて、`--audio-path direct` は `--fixed-latency-ms 1` まで clean、`--audio-path direct --clock-sync packet` は `--fixed-delay-frames 1` まで receiver 内部 metrics 上 clean でした。ただしこれは `total_buf` で見た receiver 内部 buffered latency です。実際の音として観測される遅延には audio callback period、CoreAudio / device / capture 側の固定遅延が加わります。
-
-## bit depth と clipping
-
-wire format は 16-bit PCM 固定です。内部処理と resampling は `f32` で行い、送信 packet / WAV 書き出し時に 16-bit へ変換します。
-
-24-bit 化は現時点では未実装です。音量が 0 dBFS を超えている信号は bit depth に関係なく clipping するため、clipping が気になる場合は送信元またはシステム音量を少し下げてください。24-bit 化で clipping 耐性が大きく上がるというより、量子化ノイズ余裕が増える、という性質です。
-
-## 固定仕様
-
-現時点の UDP audio packet は以下に固定しています。
+実測上の意味:
 
 ```text
-sample rate: 48000 Hz
-channels: 2
-sample format: signed 16-bit little endian PCM
-default packet duration: 5 ms
-optional packet duration: configurable by --packet-ms
-frames per packet: 240 at 5 ms, 120 at 2.5 ms, 48 at 1 ms
-payload bytes per packet: 960 at 5 ms, 480 at 2.5 ms, 192 at 1 ms
-nominal packet rate: 200 packets/s at 5 ms, 400 packets/s at 2.5 ms, 1000 packets/s at 1 ms
-nominal bitrate: 1.536 Mbps + UDP/IP overhead
+720fr / 15ms   動くが余白は少ない
+480fr / 10ms   OS scheduling limit 付近
+360fr / 7.5ms  動くことはあるが buffer floor に触れやすい
 ```
 
-5ms / 2.5ms / 1ms packet はいずれも UDP payload が通常の Ethernet MTU 1500 bytes 未満に収まるようにしています。
+低 latency を試すときに見る値:
+
+```text
+buf_min
+buf_p05
+arrival_gap_max
+send_gap_max
+startup_under
+steady_under
+missing_calls
+resyncs
+```
+
+`capture_callback_gap_max` がすでに 10-20ms なら、それより下の receiver delay は構造的に不安定になりやすいです。
+
+## 開発チェック
+
+```bash
+mise exec -- cargo fmt --all -- --check
+mise exec -- cargo test
+```
+
+macOS から Windows sender を cross-check する場合:
+
+```bash
+mise exec -- cargo check -p sender --target x86_64-pc-windows-msvc
+```
+
+launcher の展開確認:
+
+```bash
+make -n d-receiver
+make -n d-sender
+```
 
 ## トラブルシュート
 
-### receiver の device list に MacBook のスピーカーが出ない
+### sender が `remote_status=waiting` のまま
+
+feedback が接続できていません。receiver を次のように起動します。
 
 ```bash
-mise exec -- cargo run -p receiver -- --list-devices
+make d-receiver SENDER_FEEDBACK_HOST=<Windows sender LAN IP>
 ```
 
-表示されない場合:
+Windows sender 側は `scripts\windows-sender.bat` の既定で feedback listen が有効です。
 
-- macOS のサウンド設定や Audio MIDI Setup で目的の出力デバイスが有効か確認する
-- Bluetooth headphone は接続済みか確認する
-- `cargo run` ではなく build 済み binary を使っている場合、古い binary を見ていないか `mise exec -- cargo build` する
+### receiver metrics は clean なのに音がぶちぶちする
 
-### BlackHole にしているのに音が聞こえない
+`steady_under=0`、`missing_calls=0`、`loss=0`、`resyncs` が増えていないなら、receiver は枯渇していない可能性が高いです。sender capture source、VNC / screen capture load、BlackHole 後段の monitoring path を確認します。
 
-BlackHole は仮想デバイスです。システム出力を BlackHole にすると、通常のスピーカーからは直接聞こえません。
+### `capture_callback_gap_max` が 20ms 級
 
-聞くための構成:
+Windows capture data が UDP 送信前に塊で来ています。`30ms` receiver profile はこれを吸収するための設定です。さらに低 latency を狙う場合は `LAN_AUDIO_INPUT_BUFFER_SIZE_FRAMES` を変えるか、capture backend / device を見直します。
 
-```text
-System Output = BlackHole
-sender --input capture --device "BlackHole"
-receiver --output audio --output-device "MacBook Proのスピーカー"
+### device name が見つからない
+
+device list を出し、表示名の一部を指定します。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-sender.ps1 -ListDevices
 ```
-
-録音や配信アプリへ渡す構成:
-
-```text
-receiver --output audio --output-device "BlackHole"
-録音/配信アプリ側 input = BlackHole
-```
-
-### `Sample rate ... is not supported` が出る
-
-現在の receiver は output device の default output sample rate を使い、receiver 側で resampling します。古い build を実行している可能性があるので、まず再ビルドしてください。
 
 ```bash
-mise exec -- cargo build
-mise exec -- cargo run -p receiver -- --list-devices
+target/release/receiver --list-devices
 ```
 
-### `ring_under` が増える
+### BlackHole に出しているのに音が聞こえない
 
-receiver の output ring が薄いか、renderer thread が audio callback に追いついていません。
+BlackHole は仮想デバイスです。receiver の出力先が `BlackHole 2ch` の場合、別アプリで BlackHole を monitor する必要があります。receiver から直接聞く場合は `RECEIVER_OUTPUT_DEVICE` に物理出力を指定します。
 
-まず安定寄りにします。
+## Non-goals
 
-```bash
---output-ring-ms 40 \
---output-ring-capacity-ms 200 \
---render-chunk-ms 5
-```
+現時点では以下は目標外です。
 
-それでも増える場合:
+- Dante / AES67 / RTP / PTP 互換
+- 暗号化、認証
+- 複数送信元 mixer
+- kernel driver や hard real-time audio system
 
-- `--fixed-delay-frames` を大きくする。例: `14400` から `19200`
-- Bluetooth 出力ではなく内蔵スピーカーや有線出力で確認する
-- 他のCPU負荷を下げる
-
-### `qdrop` / `remote_qdrop` が増える
-
-UDP receive thread から renderer への bounded queue が詰まっています。
-
-```bash
---packet-queue-capacity 4096
-```
-
-を試してください。通常の localhost / LAN では 0 のままが期待値です。
-
-### receiver に packet が届かない
-
-- receiver を先に起動する
-- `--listen 0.0.0.0:50000` または正しい IP にする
-- sender の `--target` が receiver の IP:port を指しているか確認する
-- macOS Firewall / Windows Defender Firewall を確認する
-- まず `127.0.0.1` の loopback を通す
-
-### sender が `CABLE Output` / `BlackHole` を見つけない
-
-```bash
-mise exec -- cargo run -p sender -- --list-devices
-```
-
-実際に表示された名前の一部を `--device` に指定してください。
-
-## 開発メモ
-
-- 詳細な実装計画は `PLAN.md`
-- localhost underrun / stability review は `UPDATE.md`
-- 長時間テストや Windows 実機検証が進んだら、この README と `PLAN.md` の検証状況を更新してください。
+現在の目標は、手元の LAN で使える、ログで状態を読める、調整しやすい audio bridge です。
