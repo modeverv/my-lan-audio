@@ -667,7 +667,6 @@ dependencies = [
  "clap",
  "cpal",
  "lan-audio-common",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

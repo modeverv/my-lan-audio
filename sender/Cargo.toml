@@ -9,6 +9,3 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.18"
 lan-audio-common = { path = "../common" }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Media_Multimedia"] }

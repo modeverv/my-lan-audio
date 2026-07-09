@@ -15,7 +15,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
-use windows_sys::Win32::Media::Multimedia::{timeBeginPeriod, timeEndPeriod};
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(period_ms: u32) -> u32;
+    fn timeEndPeriod(period_ms: u32) -> u32;
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "LAN audio UDP sender")]
