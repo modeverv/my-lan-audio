@@ -1,7 +1,19 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 
 pushd "%~dp0\.." || exit /b 1
+
+if "%LAN_AUDIO_LOG_DIR%"=="" set "LAN_AUDIO_LOG_DIR=logs"
+if not exist "%LAN_AUDIO_LOG_DIR%" mkdir "%LAN_AUDIO_LOG_DIR%"
+if "%LAN_AUDIO_LOG_FILE%"=="" (
+    set "LAN_AUDIO_LOG_STAMP=!DATE!-!TIME!"
+    set "LAN_AUDIO_LOG_STAMP=!LAN_AUDIO_LOG_STAMP:/=!"
+    set "LAN_AUDIO_LOG_STAMP=!LAN_AUDIO_LOG_STAMP::=!"
+    set "LAN_AUDIO_LOG_STAMP=!LAN_AUDIO_LOG_STAMP:.=!"
+    set "LAN_AUDIO_LOG_STAMP=!LAN_AUDIO_LOG_STAMP: =0!"
+    set "LAN_AUDIO_LOG_FILE=%CD%\%LAN_AUDIO_LOG_DIR%\windows-sender-!LAN_AUDIO_LOG_STAMP!.log"
+)
+echo sender log: %LAN_AUDIO_LOG_FILE%
 
 if not "%~1"=="" goto run_args
 
@@ -32,11 +44,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0windows-sender.ps1" ^
     -CaptureQueueMode "%LAN_AUDIO_CAPTURE_QUEUE_MODE%" ^
     -CapturePacketPacing "%LAN_AUDIO_CAPTURE_PACKET_PACING%" ^
     -InputBufferSizeFrames "%LAN_AUDIO_INPUT_BUFFER_SIZE_FRAMES%" ^
+    -LogFile "%LAN_AUDIO_LOG_FILE%" ^
     -Release
 goto after_run
 
 :run_args
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0windows-sender.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0windows-sender.ps1" -LogFile "%LAN_AUDIO_LOG_FILE%" %*
 
 :after_run
 set "EXIT_CODE=%ERRORLEVEL%"

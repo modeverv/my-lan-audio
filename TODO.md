@@ -28,8 +28,20 @@ we do not jump into ASIO complexity without evidence.
    - Added `--input-buffer-size-frames` and Windows launcher plumbing so small
      CPAL input buffers can be tested before adding ASIO-specific code.
 
-4. [ ] Consider ASIO only if `capture_callback_gap_max` still shows 10ms-class
-   gaps.
+4. [x] Add native event-driven `w-sender` for Windows / VB-CABLE.
+   - `w-sender` uses native WASAPI shared event capture and sends UDP packets
+     immediately from each capture event.
+   - It does not use sender-side packet pacing, capture backlog queues, or
+     receiver feedback ASRC.
+   - Localhost self-tests are recorded in `wSELFTEST.md`; on this machine,
+     VB-CABLE delivered 480-frame events at about 100 events/s, and
+     `event_to_send_max` stayed below 1ms in the observed runs.
+
+5. [ ] Consider ASIO only if `w-sender` / WASAPI event metrics still show
+   capture-event gaps that are too coarse for the target use case.
+   - Current VB-CABLE event cadence on the tested machine is roughly 10ms
+     (`event_gap_max` around 11-12ms), which is treated as Windows/VB-CABLE
+     fixed external latency rather than sender packet pacing latency.
    - ASIO may help if the remaining spikes come from WASAPI / virtual cable
      capture scheduling.
    - It is likely to add significant Windows-specific complexity, so require

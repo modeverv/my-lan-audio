@@ -416,6 +416,35 @@ make p-receiver \
   -Device "CABLE Output"
 ```
 
+## Windows w-sender
+
+`w-sender` は Windows / VB-CABLE 向けの低遅延実験用 sender です。VB-CABLE / WASAPI capture event で届いた chunk を、その場で最大 `--max-packet-frames` ごとに UDP packet へ分割して送ります。sender 側では packet pacing timer、capture queue、sender-side ASRC を使いません。
+
+device 一覧:
+
+```powershell
+.\scripts\windows-w-sender.ps1 -ListDevices
+```
+
+localhost receiver へ送る例:
+
+```powershell
+.\scripts\windows-w-sender.ps1 `
+  -Target 127.0.0.1:50000 `
+  -Device "CABLE Output" `
+  -MaxPacketFrames 240 `
+  -Require48kStereo `
+  -Release
+```
+
+bat から起動する場合:
+
+```bat
+scripts\windows-w-sender.bat
+```
+
+`LAN_AUDIO_TARGET`、`LAN_AUDIO_DEVICE`、`LAN_AUDIO_MAX_PACKET_FRAMES` で既定値を上書きできます。localhost self-test と receiver buffer floor の測定結果は `wSELFTEST.md` を参照してください。
+
 ## sender の使い方
 
 dummy packet:

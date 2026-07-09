@@ -12,6 +12,7 @@ param(
     [double]$MetricsIntervalSec = 1.0,
     [double]$DurationSec = 0,
     [string]$OutputFile = "",
+    [string]$LogFile = "",
     [switch]$ListDevices,
     [switch]$MeterOnly,
     [switch]$Release,
@@ -63,5 +64,27 @@ if ($ListDevices) {
     }
 }
 
-& mise exec -- cargo @cargoArgs
-exit $LASTEXITCODE
+if ($LogFile) {
+    $logDir = Split-Path -Parent $LogFile
+    if ($logDir) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    $resolvedLogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogFile)
+    "sender log: $resolvedLogFile" | Tee-Object -FilePath $resolvedLogFile -Append
+    "sender command: mise exec -- cargo $($cargoArgs -join ' ')" | Tee-Object -FilePath $resolvedLogFile -Append
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & mise exec -- cargo @cargoArgs 2>&1 |
+            ForEach-Object { $_.ToString() } |
+            Tee-Object -FilePath $resolvedLogFile -Append
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+} else {
+    & mise exec -- cargo @cargoArgs
+    $exitCode = $LASTEXITCODE
+}
+
+exit $exitCode

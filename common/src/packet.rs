@@ -1,4 +1,4 @@
-use crate::audio::{CHANNELS, SAMPLE_FORMAT_S16LE, SAMPLE_RATE};
+use crate::audio::{f32_to_i16, StereoFrame, CHANNELS, SAMPLE_FORMAT_S16LE, SAMPLE_RATE};
 use std::fmt;
 
 pub const MAGIC: [u8; 4] = *b"W2MA";
@@ -80,23 +80,8 @@ impl AudioPacket {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_SIZE + self.payload.len() * 2);
-        out.extend_from_slice(&MAGIC);
-        write_u16(&mut out, self.header.version);
-        write_u16(&mut out, self.header.header_size);
-        write_u64(&mut out, self.header.stream_id);
-        write_u32(&mut out, self.header.sequence);
-        write_u32(&mut out, self.header.flags);
-        write_u32(&mut out, self.header.sample_rate);
-        write_u16(&mut out, self.header.channels);
-        write_u16(&mut out, self.header.sample_format);
-        write_u16(&mut out, self.header.frames);
-        write_u16(&mut out, self.header.reserved);
-        write_u64(&mut out, self.header.sample_position);
-        write_u64(&mut out, self.header.send_time_ns);
-
-        for sample in &self.payload {
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
+        write_packet_header(&mut out, &self.header);
+        write_i16_payload(&mut out, &self.payload);
         out
     }
 
@@ -165,6 +150,63 @@ impl AudioPacket {
     }
 }
 
+pub fn write_stereo_f32_packet_bytes(
+    out: &mut Vec<u8>,
+    header: &AudioPacketHeader,
+    frames: &[StereoFrame],
+) {
+    out.clear();
+    out.reserve(HEADER_SIZE + frames.len() * usize::from(CHANNELS) * 2);
+    write_packet_header(out, header);
+
+    for frame in frames {
+        write_i16(out, f32_to_i16(frame.left));
+        write_i16(out, f32_to_i16(frame.right));
+    }
+}
+
+pub fn write_i16_packet_bytes(
+    out: &mut Vec<u8>,
+    header: &AudioPacketHeader,
+    payload: &[i16],
+) -> Result<(), PacketError> {
+    let expected_samples = header.frames as usize * header.channels as usize;
+    if payload.len() != expected_samples {
+        return Err(PacketError::PayloadSize {
+            expected: expected_samples * 2,
+            actual: payload.len() * 2,
+        });
+    }
+
+    out.clear();
+    out.reserve(HEADER_SIZE + payload.len() * 2);
+    write_packet_header(out, header);
+    write_i16_payload(out, payload);
+    Ok(())
+}
+
+pub fn write_packet_header(out: &mut Vec<u8>, header: &AudioPacketHeader) {
+    out.extend_from_slice(&MAGIC);
+    write_u16(out, header.version);
+    write_u16(out, header.header_size);
+    write_u64(out, header.stream_id);
+    write_u32(out, header.sequence);
+    write_u32(out, header.flags);
+    write_u32(out, header.sample_rate);
+    write_u16(out, header.channels);
+    write_u16(out, header.sample_format);
+    write_u16(out, header.frames);
+    write_u16(out, header.reserved);
+    write_u64(out, header.sample_position);
+    write_u64(out, header.send_time_ns);
+}
+
+pub fn write_i16_payload(out: &mut Vec<u8>, payload: &[i16]) {
+    for sample in payload {
+        write_i16(out, *sample);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketError {
     TooShort {
@@ -212,6 +254,10 @@ impl fmt::Display for PacketError {
 }
 
 impl std::error::Error for PacketError {}
+
+fn write_i16(out: &mut Vec<u8>, value: i16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
 
 fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -282,6 +328,36 @@ mod tests {
         let bytes = packet.to_bytes();
         assert_eq!(bytes.len(), HEADER_SIZE + 8);
         assert_eq!(AudioPacket::from_bytes(&bytes).unwrap(), packet);
+    }
+
+    #[test]
+    fn writes_i16_packet_bytes() {
+        let packet = test_packet();
+        let mut bytes = Vec::new();
+        write_i16_packet_bytes(&mut bytes, &packet.header, &packet.payload).unwrap();
+
+        assert_eq!(bytes, packet.to_bytes());
+    }
+
+    #[test]
+    fn writes_stereo_f32_packet_bytes() {
+        let header = AudioPacketHeader::new(1, 2, 2, 0, 3);
+        let frames = vec![
+            StereoFrame {
+                left: 0.0,
+                right: 1.0,
+            },
+            StereoFrame {
+                left: -1.0,
+                right: 0.5,
+            },
+        ];
+        let mut bytes = Vec::new();
+        write_stereo_f32_packet_bytes(&mut bytes, &header, &frames);
+        let packet = AudioPacket::from_bytes(&bytes).unwrap();
+
+        assert_eq!(packet.header, header);
+        assert_eq!(packet.payload, vec![0, i16::MAX, i16::MIN, 16384]);
     }
 
     #[test]

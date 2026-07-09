@@ -4,8 +4,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24, U24,
 };
-use lan_audio_common::audio::{f32_to_i16, rms_db, StereoFrame, CHANNELS, SAMPLE_RATE};
-use lan_audio_common::packet::{AudioPacketHeader, HEADER_SIZE, MAGIC};
+use lan_audio_common::audio::{rms_db, StereoFrame, CHANNELS, SAMPLE_RATE};
+use lan_audio_common::packet::{write_stereo_f32_packet_bytes, AudioPacketHeader, HEADER_SIZE};
 use lan_audio_common::resampler::StreamingLinearResampler;
 use lan_audio_common::status::ReceiverStatus;
 use std::collections::VecDeque;
@@ -609,7 +609,7 @@ impl PacketSender {
             self.sample_position,
             dispatch_at.duration_since(self.start).as_nanos() as u64,
         );
-        write_packet_bytes(&mut self.packet_bytes, &header, frames);
+        write_stereo_f32_packet_bytes(&mut self.packet_bytes, &header, frames);
         self.sequence = self.sequence.wrapping_add(1);
         self.sample_position += frames.len() as u64;
         self.send_current_packet()
@@ -654,45 +654,6 @@ impl PacketSender {
 struct PacketDispatchTimingSnapshot {
     gap_count: u64,
     gap_max: Duration,
-}
-
-fn write_packet_bytes(out: &mut Vec<u8>, header: &AudioPacketHeader, frames: &[StereoFrame]) {
-    out.clear();
-    out.reserve(HEADER_SIZE + frames.len() * usize::from(CHANNELS) * 2);
-    out.extend_from_slice(&MAGIC);
-    write_u16(out, header.version);
-    write_u16(out, header.header_size);
-    write_u64(out, header.stream_id);
-    write_u32(out, header.sequence);
-    write_u32(out, header.flags);
-    write_u32(out, header.sample_rate);
-    write_u16(out, header.channels);
-    write_u16(out, header.sample_format);
-    write_u16(out, header.frames);
-    write_u16(out, header.reserved);
-    write_u64(out, header.sample_position);
-    write_u64(out, header.send_time_ns);
-
-    for frame in frames {
-        write_i16(out, f32_to_i16(frame.left));
-        write_i16(out, f32_to_i16(frame.right));
-    }
-}
-
-fn write_i16(out: &mut Vec<u8>, value: i16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
 }
 
 struct MetricsPrinter {
